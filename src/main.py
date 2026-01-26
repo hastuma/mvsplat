@@ -1,4 +1,9 @@
 import os
+
+# Workaround for internal PyTorch assert error (Allocator crash)
+# Must be set BEFORE everything else.
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False,max_split_size_mb:128"
+
 from pathlib import Path
 import warnings
 
@@ -14,6 +19,14 @@ from pytorch_lightning.callbacks import (
     ModelCheckpoint,
 )
 from pytorch_lightning.loggers.wandb import WandbLogger
+
+# Set PyTorch memory allocator to reduce fragmentation
+# os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
+# source /project/winston/miniconda3/bin/activate mvsplat   && CUDA_VISIBLE_DEVICES=1 python -m src.main +experiment=dfc2019
+# PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False,max_split_size_mb:128" CUDA_VISIBLE_DEVICES=0,1 python -m src.main +experiment=dfc2019
+# CUDA_VISIBLE_DEVICES=4 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=1
+# CUDA_VISIBLE_DEVICES=0,1,2,3 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=3
+
 
 # Configure beartype and jaxtyping.
 with install_import_hook(
@@ -112,10 +125,12 @@ def train(cfg_dict: DictConfig):
         strategy="ddp" if torch.cuda.device_count() > 1 else "auto",
         callbacks=callbacks,
         val_check_interval=cfg.trainer.val_check_interval,
-        enable_progress_bar=cfg.mode == "test",
+        enable_progress_bar=True,
         gradient_clip_val=cfg.trainer.gradient_clip_val,
         max_steps=cfg.trainer.max_steps,
         num_sanity_val_steps=cfg.trainer.num_sanity_val_steps,
+        precision="32",  # Use full precision as requested by user
+        accumulate_grad_batches=getattr(cfg.trainer, 'accumulate_grad_batches', 1),
     )
     torch.manual_seed(cfg_dict.seed + trainer.global_rank)
 
@@ -160,6 +175,7 @@ def train(cfg_dict: DictConfig):
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
-    torch.set_float32_matmul_precision('high')
-
+    # torch.set_float32_matmul_precision('high') # Disabled for stability
+    torch.backends.cudnn.benchmark = False
+    
     train()

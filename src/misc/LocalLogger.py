@@ -42,7 +42,22 @@ class LocalLogger(Logger):
         # The function signature is the same as the wandb logger's, but the step is
         # actually required.
         assert step is not None
+        captions = kwargs.get("caption", None)
+        
         for index, image in enumerate(images):
-            path = LOG_PATH / f"{key}/{index:0>2}_{step:0>6}.png"
+            name_part = f"{index:0>2}"
+            if captions is not None:
+                if isinstance(captions, list) and index < len(captions):
+                     name_part = f"{captions[index]}"
+                elif isinstance(captions, str):
+                     name_part = f"{captions}"
+                     if len(images) > 1:
+                         name_part += f"_{index}"
+            
+            # Sanitize filename
+            if isinstance(name_part, str):
+                name_part = "".join(c for c in name_part if c.isalnum() or c in ('_', '-'))
+
+            path = LOG_PATH / f"{key}/{step:0>6}_{name_part}.png"
             path.parent.mkdir(exist_ok=True, parents=True)
             Image.fromarray(image).save(path)

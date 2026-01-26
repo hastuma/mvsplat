@@ -172,6 +172,8 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
         # Sample depths from the resulting features.
         in_feats = trans_features
         extra_info = {}
+        if "rpc" in context:
+            extra_info["rpcs"] = context["rpc"]
         extra_info['images'] = rearrange(context["image"], "b v c h w -> (v b) c h w")
         extra_info["scene_names"] = scene_names
         gpp = self.cfg.gaussians_per_pixel

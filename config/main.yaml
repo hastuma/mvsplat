@@ -5,6 +5,8 @@ defaults:
   - model/decoder: splatting_cuda
   - loss: [mse]
 
+
+
 wandb:
   project: mvsplat
   entity: placeholder
@@ -42,7 +44,7 @@ optimizer:
 
 checkpointing:
   load: null
-  every_n_train_steps: 20000  # 5000
+  every_n_train_steps: 250  # 原本是 20000，改為每 100 步儲存
   save_top_k: -1
   pretrained_model: null
   resume: true

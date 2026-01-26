@@ -60,6 +60,18 @@ def render_cuda(
 ) -> Float[Tensor, "batch 3 height width"]:
     assert use_sh or gaussian_sh_coefficients.shape[-1] == 1
 
+    # Cast all inputs to float32 to ensure compatibility with C++ rasterizer, 
+    # which does not support half precision (AMP).
+    extrinsics = extrinsics.float()
+    intrinsics = intrinsics.float()
+    near = near.float()
+    far = far.float()
+    background_color = background_color.float()
+    gaussian_means = gaussian_means.float()
+    gaussian_covariances = gaussian_covariances.float()
+    gaussian_sh_coefficients = gaussian_sh_coefficients.float()
+    gaussian_opacities = gaussian_opacities.float()
+
     # Make sure everything is in a range where numerical issues don't appear.
     if scale_invariant:
         scale = 1 / near
@@ -115,12 +127,12 @@ def render_cuda(
         row, col = torch.triu_indices(3, 3)
 
         image, radii = rasterizer(
-            means3D=gaussian_means[i],
-            means2D=mean_gradients,
-            shs=shs[i] if use_sh else None,
-            colors_precomp=None if use_sh else shs[i, :, 0, :],
-            opacities=gaussian_opacities[i, ..., None],
-            cov3D_precomp=gaussian_covariances[i, :, row, col],
+            means3D=gaussian_means[i].float(),
+            means2D=mean_gradients.float(),
+            shs=shs[i].float() if use_sh else None,
+            colors_precomp=None if use_sh else shs[i, :, 0, :].float(),
+            opacities=gaussian_opacities[i, ..., None].float(),
+            cov3D_precomp=gaussian_covariances[i, :, row, col].float(),
         )
         all_images.append(image)
         all_radii.append(radii)
