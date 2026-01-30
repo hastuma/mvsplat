@@ -186,6 +186,13 @@ class ModelWrapper(LightningModule):
                 self.global_step,
                 deterministic=False,
             )
+
+        # Export PLY if enabled in encoder config
+        # Note: This relies on the hacky export_ply inside visualizer.visualize
+        if self.train_cfg.extended_visualization or (
+            self.encoder_visualizer is not None and getattr(self.encoder_visualizer.cfg, "export_ply", False)
+        ):
+             self.encoder_visualizer.visualize(batch["context"], self.global_step)
         with self.benchmarker.time("decoder", num_calls=v):
             output = self.decoder.forward(
                 gaussians,
@@ -480,8 +487,15 @@ class ModelWrapper(LightningModule):
 
         # Color-map the result.
         def depth_map(result):
-            near = result[result > 0][:16_000_000].quantile(0.01).log()
-            far = result.view(-1)[:16_000_000].quantile(0.99).log()
+            valid_depths = result[result > 0][:16_000_000]
+            if valid_depths.numel() == 0:
+                # Fallback for empty depth maps
+                near = torch.tensor(0.01, device=result.device).log()
+                far = torch.tensor(100.0, device=result.device).log()
+            else:
+                near = valid_depths.quantile(0.01).log()
+                far = result.view(-1)[:16_000_000].quantile(0.99).log()
+            
             result = result.log()
             result = 1 - (result - near) / (far - near)
             return apply_color_map_to_image(result, "turbo")
@@ -528,7 +542,7 @@ class ModelWrapper(LightningModule):
             assert isinstance(self.logger, LocalLogger)
             for key, value in visualizations.items():
                 tensor = value._prepare_video(value.data)
-                clip = mpy.ImageSequenceClip(list(tensor), fps=value._fps)
+                clip = mpy.ImageSequenceClip(list(tensor), fps=30)
                 dir = LOG_PATH / key
                 dir.mkdir(exist_ok=True, parents=True)
                 clip.write_videofile(

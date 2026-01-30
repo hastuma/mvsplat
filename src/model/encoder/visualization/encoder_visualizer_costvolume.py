@@ -17,7 +17,7 @@ from ....visualization.colors import get_distinct_color
 from ....visualization.drawing.lines import draw_lines
 from ....visualization.drawing.points import draw_points
 from ....visualization.layout import add_border, hcat, vcat
-# from ...ply_export import export_ply
+from ...ply_export import export_ply
 from ..encoder_costvolume import EncoderCostVolume
 # from ..epipolar.epipolar_sampler import EpipolarSampling
 from .encoder_visualizer import EncoderVisualizer
@@ -82,8 +82,11 @@ class EncoderVisualizerCostVolume(
             )
 
         # This is kind of hacky for now, since we're using it for short experiments.
-        if self.cfg.export_ply and wandb.run is not None:
-            name = wandb.run._name.split(" ")[0]
+        if self.cfg.export_ply:
+            if wandb.run is not None:
+                name = wandb.run._name.split(" ")[0]
+            else:
+                name = "local"
             ply_path = Path(f"outputs/gaussians/{name}/{global_step:0>6}.ply")
             export_ply(
                 context["extrinsics"][0, 0],

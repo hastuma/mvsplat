@@ -21,13 +21,28 @@ from pytorch_lightning.callbacks import (
 from pytorch_lightning.loggers.wandb import WandbLogger
 
 # Set PyTorch memory allocator to reduce fragmentation
+
+
+
+## inference 
+
+# CUDA_VISIBLE_DEVICES=0 python -m src.main \
+#     +experiment=dfc2019 \
+#     mode=test \
+#     checkpointing.load=/project/winston/mvsplat/outputs/2026-01-26/18-21-36_ver2/checkpoints/epoch_7-step_42750.ckpt \
+#     model.encoder.visualizer.export_ply=true \
+#     data_loader.test.batch_size=1
+
+
+##traininig 
+
+
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
 # source /project/winston/miniconda3/bin/activate mvsplat   && CUDA_VISIBLE_DEVICES=1 python -m src.main +experiment=dfc2019
 # PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False,max_split_size_mb:128" CUDA_VISIBLE_DEVICES=0,1 python -m src.main +experiment=dfc2019
 # CUDA_VISIBLE_DEVICES=4 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=1
 # CUDA_VISIBLE_DEVICES=0,1,2,3 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=3
-
-
+#  CUDA_VISIBLE_DEVICES=1 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=1
 # Configure beartype and jaxtyping.
 with install_import_hook(
     ("src",),
@@ -95,8 +110,7 @@ def train(cfg_dict: DictConfig):
         if wandb.run is not None:
             wandb.run.log_code("src")
     else:
-        logger = LocalLogger()
-
+        logger = LocalLogger(output_dir)
     # Set up checkpointing.
     callbacks.append(
         ModelCheckpoint(
@@ -175,7 +189,8 @@ def train(cfg_dict: DictConfig):
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
-    # torch.set_float32_matmul_precision('high') # Disabled for stability
+    # torch.set_float32_matmul_precision('high')
+
     torch.backends.cudnn.benchmark = False
     
     train()

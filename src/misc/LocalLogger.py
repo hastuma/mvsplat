@@ -1,4 +1,5 @@
 import os
+import csv
 from pathlib import Path
 from typing import Any, Optional
 
@@ -10,10 +11,16 @@ LOG_PATH = Path("outputs/local")
 
 
 class LocalLogger(Logger):
-    def __init__(self) -> None:
+    def __init__(self, output_dir: Optional[Path] = None) -> None:
         super().__init__()
         self.experiment = None
-        os.system(f"rm -r {LOG_PATH}")
+        # Set up CSV logging
+        self.output_dir = output_dir if output_dir is not None else LOG_PATH
+        self.metrics_file = self.output_dir / "metrics.csv"
+        self.metrics_file.parent.mkdir(exist_ok=True, parents=True)
+        self._csv_writer = None
+        self._csv_file = None
+        self._fieldnames = set()
 
     @property
     def name(self):
@@ -29,7 +36,44 @@ class LocalLogger(Logger):
 
     @rank_zero_only
     def log_metrics(self, metrics, step):
-        pass
+        # Write metrics to CSV file
+        if not metrics:
+            return
+        
+        # Add step to metrics
+        metrics_with_step = {"step": step, **metrics}
+        
+        # Check if we need to initialize or update CSV headers
+        new_fields = set(metrics_with_step.keys()) - self._fieldnames
+        if new_fields or self._csv_writer is None:
+            self._fieldnames.update(metrics_with_step.keys())
+            
+            # Read existing data if file exists
+            existing_data = []
+            if self.metrics_file.exists():
+                with open(self.metrics_file, 'r') as f:
+                    reader = csv.DictReader(f)
+                    existing_data = list(reader)
+            
+            # Close old file if open
+            if self._csv_file is not None:
+                self._csv_file.close()
+            
+            # Rewrite with new headers
+            self._csv_file = open(self.metrics_file, 'w', newline='')
+            self._csv_writer = csv.DictWriter(
+                self._csv_file, 
+                fieldnames=sorted(self._fieldnames)
+            )
+            self._csv_writer.writeheader()
+            
+            # Write back existing data
+            for row in existing_data:
+                self._csv_writer.writerow(row)
+        
+        # Write the new metrics
+        self._csv_writer.writerow(metrics_with_step)
+        self._csv_file.flush()
 
     @rank_zero_only
     def log_image(
