@@ -19,7 +19,7 @@ dataset:
     name: bounded
     num_context_views: 3
     num_target_views: 1 # Reconstruction/Novel view is implied by target=context usually or similar
-  roots: [/project/winston/datasets/DFC2019/skysplat_version_2/]
+  roots: [/project/winston/datasets/DFC2019/overfit/]
   image_shape: [256, 256]  # Restored to SkySplat training patch size
   near: -50.0
   far: 300.0
@@ -27,13 +27,13 @@ dataset:
 
 data_loader:
   train:
-    batch_size: 3
+    batch_size: 1
     num_workers: 0  # Disable multi-process loading to save memory
   val:
-    batch_size: 3
+    batch_size: 1
     num_workers: 0
   test:
-    batch_size: 3
+    batch_size: 1
     num_workers: 0
 
 optimizer:
@@ -43,7 +43,7 @@ optimizer:
 trainer:
   num_sanity_val_steps: 0  # Skip sanity check to save memory
   gradient_clip_val: 1.0
-  accumulate_grad_batches: 2  # Accumulate gradients to simulate larger batch
+  accumulate_grad_batches: 6  # Accumulate gradients to simulate larger batch
   max_steps: 200000 # Explicitly set max_steps for OneCycleLR
 
 model:

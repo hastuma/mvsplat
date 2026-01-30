@@ -26,7 +26,7 @@ from pytorch_lightning.loggers.wandb import WandbLogger
 
 ## inference 
 
-# CUDA_VISIBLE_DEVICES=0 python -m src.main \
+# CUDA_VISIBLE_DEVICES=4 python -m src.main \
 #     +experiment=dfc2019 \
 #     mode=test \
 #     checkpointing.load=/project/winston/mvsplat/outputs/2026-01-26/18-21-36_ver2/checkpoints/epoch_7-step_42750.ckpt \
@@ -41,7 +41,7 @@ from pytorch_lightning.loggers.wandb import WandbLogger
 # source /project/winston/miniconda3/bin/activate mvsplat   && CUDA_VISIBLE_DEVICES=1 python -m src.main +experiment=dfc2019
 # PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False,max_split_size_mb:128" CUDA_VISIBLE_DEVICES=0,1 python -m src.main +experiment=dfc2019
 # CUDA_VISIBLE_DEVICES=4 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=1
-# CUDA_VISIBLE_DEVICES=0,1,2,3 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=3
+# CUDA_VISIBLE_DEVICES=9 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=2
 #  CUDA_VISIBLE_DEVICES=1 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=1
 # Configure beartype and jaxtyping.
 with install_import_hook(

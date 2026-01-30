@@ -123,13 +123,16 @@ class DFC2019Dataset(Dataset):
             if ds is None:
                 raise IOError(f"Could not open {fpath}")
             
-            width = ds.RasterXSize
-            height = ds.RasterYSize
+            orig_w = ds.RasterXSize
+            orig_h = ds.RasterYSize
+            
+            target_h, target_w = self.cfg.image_shape
             
             # Read bands (assuming RGB)
             # DFC2019 might be uint8 or uint16.
             # MVSplat expects float [0,1] tensors
-            arr = ds.ReadAsArray() # [C, H, W]
+            # Load directly into target size for memory efficiency
+            arr = ds.ReadAsArray(buf_xsize=target_w, buf_ysize=target_h) # [C, H, W]
             if arr.shape[0] > 3:
                 arr = arr[:3] # RGB
             
@@ -143,6 +146,20 @@ class DFC2019Dataset(Dataset):
             
             # Parse RPC
             rpc_coeff = self._parse_rpc(ds)
+            
+            # Scale RPC to match the resized image
+            scale_h = target_h / float(orig_h)
+            scale_w = target_w / float(orig_w)
+            
+            # rpcs is [90]
+            # 0: LINE_OFF, 1: LINE_SCALE
+            rpc_coeff[0] *= scale_h
+            rpc_coeff[1] *= scale_h
+            
+            # 2: SAMP_OFF, 3: SAMP_SCALE
+            rpc_coeff[2] *= scale_w
+            rpc_coeff[3] *= scale_w
+            
             rpc_tensor = torch.from_numpy(rpc_coeff)
             
             return tensor_img, rpc_tensor
@@ -166,27 +183,7 @@ class DFC2019Dataset(Dataset):
         images = torch.stack(images) # [V, C, H, W]
         rpcs = torch.stack(rpcs)     # [V, 90]
         
-        # Resize to 768x768 (SkySplat)
-        target_h, target_w = 768, 768
-        orig_h, orig_w = images.shape[-2], images.shape[-1]
-        
-        if orig_h != target_h or orig_w != target_w:
-            import torch.nn.functional as F
-            images = F.interpolate(images, size=(target_h, target_w), mode='area')
-            
-            # Adjust RPCs
-            # Scale factors
-            scale_h = target_h / float(orig_h)
-            scale_w = target_w / float(orig_w)
-            
-            # rpcs is [V, 90]
-            # 0: LINE_OFF, 1: LINE_SCALE
-            rpcs[:, 0] *= scale_h
-            rpcs[:, 1] *= scale_h
-            
-            # 2: SAMP_OFF, 3: SAMP_SCALE
-            rpcs[:, 2] *= scale_w
-            rpcs[:, 3] *= scale_w
+        # Images are already resized in load_view
             
         # Dummy extrinsics/intrinsics/near/far
         V, C, H, W = images.shape
