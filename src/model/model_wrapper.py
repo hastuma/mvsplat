@@ -146,14 +146,16 @@ class ModelWrapper(LightningModule):
             rpc_target_flat = RPC(rearrange(batch["target"]["rpc"], "b v c -> (b v) c"))
             
             # The RPCs in this dataset are already adjusted for the 256x256 crops.
-            # We use the actual image resolution (h, w) as the reference for geometry.
-            distance = 100.0  # 相機高度 100 米
-            K_tgt, c2w_tgt = rpc_target_flat.compute_camera_geometry(h, w, lat_ref_flat, lon_ref_flat, distance=distance)
+            # compute_camera_geometry 現在由 RPC Jacobian 推算 GSD 和 distance，
+            # 回傳三元組 (K, c2w, distance)，其中 distance: [B*V_tgt]。
+            K_tgt, c2w_tgt, distance_tgt_flat = rpc_target_flat.compute_camera_geometry(h, w, lat_ref_flat, lon_ref_flat)
             
             # Since RPC and Image are both (h, w), no further scaling of K is needed for projection.
             # Just ensure the batch is updated with these consistent matrices.
             batch["target"]["extrinsics"] = rearrange(c2w_tgt, "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
             batch["target"]["intrinsics"] = rearrange(K_tgt, "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
+            # 儲存 per-view distance [B, V_tgt] 供後續 near/far 使用
+            batch["target"]["_virtual_camera_distance"] = rearrange(distance_tgt_flat, "(b v) -> b v", b=b_tgt, v=v_tgt)
             print(type(batch["context"]))
             # print(batch["context"])
             print(batch["context"]["image"].shape)
@@ -257,30 +259,33 @@ class ModelWrapper(LightningModule):
             # 從 RPC 參數取得場景高度範圍
             h_off = batch["context"]["rpc"][:, 0, 8]    # HEIGHT_OFF [B]
             h_scale = batch["context"]["rpc"][:, 0, 9]  # HEIGHT_SCALE [B]
-            distance = 100.0  # 虛擬相機高度
             
-            # 場景高度範圍（MSL 絕對高度）
-            scene_z_min = h_off - h_scale  # 最低高度
-            scene_z_max = h_off + h_scale  # 最高高度
+            # 使用由 RPC GSD 推算的 per-view distance（若已儲存），否則回退到保守預設值
+            b_tgt, v_tgt = batch["target"]["extrinsics"].shape[:2]
+            if "_virtual_camera_distance" in batch["target"]:
+                # [B, V_tgt] — 每個 target 視角各自的虛擬相機高度
+                distance_tgt = batch["target"]["_virtual_camera_distance"]  # [B, V_tgt]
+            else:
+                distance_tgt = torch.full((b_tgt, v_tgt), 100.0,
+                                          device=h_off.device, dtype=h_off.dtype)
             
-            # 相機高度（MSL 絕對高度）
-            camera_z = h_off + distance
+            # 場景高度範圍（MSL 絕對高度），擴展至 [B, V_tgt]
+            scene_z_min = (h_off - h_scale).unsqueeze(1).expand(b_tgt, v_tgt)  # 最低高度
+            scene_z_max = (h_off + h_scale).unsqueeze(1).expand(b_tgt, v_tgt)  # 最高高度
+            
+            # 相機高度（MSL 絕對高度）：[B, V_tgt]
+            camera_z = h_off.unsqueeze(1) + distance_tgt  # [B, V_tgt]
             
             # 相機座標系的 near/far（相機到場景的距離）
             margin = 10.0  # 額外邊界避免裁剪
             render_near = (camera_z - scene_z_max - margin).clamp(min=1.0)
             render_far = (camera_z - scene_z_min + margin).clamp(min=render_near + 1.0)
             
-            # 擴展到 [B, V] 形狀
-            b_tgt, v_tgt = batch["target"]["extrinsics"].shape[:2]
-            render_near = render_near.unsqueeze(1).expand(b_tgt, v_tgt)
-            render_far = render_far.unsqueeze(1).expand(b_tgt, v_tgt)
-            
             if self.global_step % 50 == 0:
                 print(f"\n🔧 [RENDER NEAR/FAR] model_wrapper")
                 print(f"   HEIGHT_OFF: {h_off[0].item():.1f}, HEIGHT_SCALE: {h_scale[0].item():.1f}")
-                print(f"   Scene Z (MSL): [{scene_z_min[0].item():.1f}, {scene_z_max[0].item():.1f}]")
-                print(f"   Camera Z (MSL): {camera_z[0].item():.1f}")
+                print(f"   Scene Z (MSL): [{scene_z_min[0,0].item():.1f}, {scene_z_max[0,0].item():.1f}]")
+                print(f"   Camera Z (MSL): {camera_z[0,0].item():.1f} (distance={distance_tgt[0,0].item():.1f}m)")
                 print(f"   ✅ Render near/far: [{render_near[0,0].item():.1f}, {render_far[0,0].item():.1f}]")
         else:
             render_near = batch["target"]["near"]

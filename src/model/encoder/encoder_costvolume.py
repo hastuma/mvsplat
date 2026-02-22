@@ -203,16 +203,17 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             context["_lat_ref"] = lat_ref_b
             context["_lon_ref"] = lon_ref_b
             
-            distance = 100.0 
-            
-            K_approx, c2w = rpc_flat.compute_camera_geometry(h, w, lat_ref_b, lon_ref_b, distance=distance)
+            # 從 RPC Jacobian 推算 GSD，再由目標半視角決定 distance（不再使用固定值）。
+            # compute_camera_geometry 回傳 (K, c2w, distance)，其中
+            # distance: [B*V] 每個虛擬相機相對 HEIGHT_OFF 的高度（米）。
+            K_approx, c2w, distance_flat = rpc_flat.compute_camera_geometry(h, w, lat_ref_b, lon_ref_b)
             
             # Update Context: Now depth_predictor will see these correct cameras!
             context["extrinsics"] = rearrange(c2w, "(b v) i j -> b v i j", b=b, v=v)
             context["intrinsics"] = rearrange(K_approx, "(b v) i j -> b v i j", b=b, v=v)
             
-            # 存儲 distance 供後續使用
-            context["_virtual_camera_distance"] = distance
+            # 存儲 per-view distance [B, V] 供後續 near/far 和 altitude 計算使用
+            context["_virtual_camera_distance"] = rearrange(distance_flat, "(b v) -> b v", b=b, v=v)
 
         # ============================================================
         # 動態計算 near/far（相機座標系的深度範圍）
@@ -284,7 +285,8 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
         if "rpc" in context:
             # RPC branch: Compute ENU means using the already updated cameras
             b, v, r, srf, _ = depths.shape
-            distance = context["_virtual_camera_distance"]
+            # distance_bv: [B, V] per-view 虛擬相機高度（由 RPC GSD 推算）
+            distance_bv = context["_virtual_camera_distance"]  # [B, V]
             
             u_all = rearrange(xy_ray[..., 1] * h, "b v r srf -> (b v r srf)")
             v_all = rearrange(xy_ray[..., 0] * w, "b v r srf -> (b v r srf)")
@@ -293,8 +295,11 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             dist_all = rearrange(depths, "b v r srf () -> (b v r srf)")
             h_off_all_v = rearrange(repeat(context["rpc"][:, :, 8], "b v -> b v r srf", r=r, srf=srf), "b v r srf -> (b v r srf)")
             
-            # Altitude = Cam_Altitude - Distance
-            h_all = (h_off_all_v + distance) - dist_all
+            # 將 per-view distance 擴展為和 dist_all 相同的形狀 [B*V*R*SRF]
+            distance_all = rearrange(repeat(distance_bv, "b v -> b v r srf", r=r, srf=srf), "b v r srf -> (b v r srf)")
+            
+            # Altitude = Cam_Altitude - NetworkOutputDistance
+            h_all = (h_off_all_v + distance_all) - dist_all
             
             # ============================================================
             # [DEBUG] 儲存 3 個視角的預測高度圖 (Height Maps)

@@ -191,61 +191,82 @@ class RPC:
         K[..., 0, 2], K[..., 1, 2] = img_w / 2.0, img_h / 2.0
         
         return K.to(dtype=torch.float32), R_c2w.to(dtype=torch.float32)
-    def compute_camera_geometry(self, h: int, w: int, lat_ref_global: Tensor = None, lon_ref_global: Tensor = None, distance: float = 100.0, gsd: float = 0.5):
+    def compute_camera_geometry(self, h: int, w: int, lat_ref_global: Tensor = None, lon_ref_global: Tensor = None,
+                                target_half_fov_deg: float = 30.0, min_distance: float = 40.0) -> Tuple[Tensor, Tensor, Tensor]:
         """
-        計算虛擬針孔相機的內參和外參
-        
+        從 RPC 模型近似出針孔相機的內參與外參，相機高度由 RPC Jacobian
+        推導出的真實 GSD 決定，不再使用硬編碼的固定值。
+
         Args:
             h, w: 圖像尺寸（像素）
             lat_ref_global, lon_ref_global: ENU 座標系原點的經緯度
-            distance: 相機距離 HEIGHT_OFF 參考面的高度（米）
-            gsd: Ground Sample Distance（米/像素），衛星圖像的空間解析度
-        
+            target_half_fov_deg: 虛擬相機的目標半視角（度），用於決定
+                相機高度 distance = (image_half_footprint) / tan(target_half_fov)
+                預設 30°（等效 60° 全視角），適合 cost volume 近/遠面比例。
+            min_distance: distance 的最小值（米），確保 near > 0。
+
         Returns:
-            K: [B, 3, 3] 內參矩陣
-            c2w: [B, 4, 4] camera-to-world 外參矩陣
-        
+            K:        [B, 3, 3]  內參矩陣（焦距由 GSD 推算）
+            c2w:      [B, 4, 4]  camera-to-world 外參矩陣
+            distance: [B]        每個相機的虛擬相機高度（米，相對 HEIGHT_OFF）
+
         座標系定義：
             - ENU 世界座標系：X=東, Y=北, Z=上
             - 相機位於 HEIGHT_OFF + distance 高度
             - 相機 Z 軸指向地面（向下看）
         """
+        import math
         device = self.device
         dtype = self.line_off.dtype
         B = self.line_off.shape[0]
-        
+
         u_center = torch.full((B,), w / 2.0, device=device, dtype=dtype)
         v_center = torch.full((B,), h / 2.0, device=device, dtype=dtype)
         h_mean = self.height_off  # RPC 參考高度 (MSL)
-        
-        # 從 RPC 計算局部相機方向（現在 Z 軸已正確指向場景）
+
+        # Step 1: 從 RPC Jacobian 獲取局部相機方向 + 真實 GSD
+        # get_pinhole_approximation 返回的 K[0,0] = 1/GSD_x, K[1,1] = 1/GSD_y
+        # 其中 GSD_x, GSD_y 單位為 meters/pixel
         K, R_c2w = self.get_pinhole_approximation(u_center, v_center, h_mean, image_size=(h, w))
         K = K.clone()
-        
-        # 重新計算焦距以匹配虛擬相機高度和 GSD
-        # focal = distance / gsd 讓 FOV 正好覆蓋 image_size * gsd 米
-        focal = distance / gsd
-        K[..., 0, 0], K[..., 1, 1] = focal, focal
-        K[..., 0, 2], K[..., 1, 2] = w / 2.0, h / 2.0
-        
-        # 計算相機在 ENU 座標系中的位置
+
+        # Step 2: 從 K 解回真實 GSD（米/像素）
+        # 注意：get_pinhole_approximation 中 fx = 1 / c_right.norm()，即 GSD 的倒數
+        gsd_x = (1.0 / K[..., 0, 0].clamp(min=1e-8)).float()  # [B] meters/pixel
+        gsd_y = (1.0 / K[..., 1, 1].clamp(min=1e-8)).float()  # [B] meters/pixel
+
+        # Step 3: 由目標半視角計算 distance
+        # tan(half_fov) = half_footprint / distance
+        # half_footprint_x = (w/2) * GSD_x
+        # → distance_x = (w/2 * GSD_x) / tan(half_fov)
+        tan_half_fov = math.tan(math.radians(target_half_fov_deg))
+        D_x = (w / 2.0) * gsd_x / tan_half_fov  # [B]
+        D_y = (h / 2.0) * gsd_y / tan_half_fov  # [B]
+        distance = ((D_x + D_y) / 2.0).clamp(min=float(min_distance))  # [B]
+
+        # Step 4: 用推算出的 distance 重新計算焦距（focal = distance / GSD）
+        focal_x = distance / gsd_x  # [B]
+        focal_y = distance / gsd_y  # [B]
+        K[..., 0, 0] = focal_x
+        K[..., 1, 1] = focal_y
+        K[..., 0, 2] = w / 2.0
+        K[..., 1, 2] = h / 2.0
+
+        # Step 5: 計算相機在 ENU 座標系中的位置
         with torch.no_grad():
             lat_c, lon_c = self.inverse(u_center, v_center, h_mean)
-        
+
         lat_ref, lon_ref = (lat_c, lon_c) if lat_ref_global is None else (lat_ref_global, lon_ref_global)
         r_earth, rad = 6378137.0, 3.1415926535 / 180.0
-        
+
         # ENU 座標（相對於參考點）
-        x_c = (lon_c - lon_ref) * rad * r_earth * torch.cos(lat_ref * rad)  # 東
-        y_c = (lat_c - lat_ref) * rad * r_earth  # 北
-        z_c = h_mean + distance  # 上（相機在參考面上方 distance 米）
-        
-        # 建構 4x4 c2w 矩陣
+        x_c = (lon_c - lon_ref) * rad * r_earth * torch.cos(lat_ref * rad)  # 東 [B]
+        y_c = (lat_c - lat_ref) * rad * r_earth                              # 北 [B]
+        z_c = h_mean.float() + distance                                       # 上 [B]（相機在參考面上方 distance 米）
+
+        # Step 6: 建構 4x4 c2w 矩陣
         c2w = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
-        
-        # 使用從 RPC 計算得到的真實旋轉矩陣
-        # R_c2w 現在正確表示相機的方向（Z 軸指向地面）
         c2w[:, :3, :3] = R_c2w
         c2w[:, :3, 3] = torch.stack([x_c, y_c, z_c], dim=-1)
-        
-        return K.to(dtype=torch.float32), c2w.to(dtype=torch.float32)
+
+        return K.to(dtype=torch.float32), c2w.to(dtype=torch.float32), distance.to(dtype=torch.float32)
