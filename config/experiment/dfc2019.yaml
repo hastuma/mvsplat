@@ -12,6 +12,10 @@ wandb:
   entity: null
   name: dfc2019_rpc_training
 
+checkpointing:
+  load: checkpoints/gmdepth-scale1-resumeflowthings-scannet-5d9d7964.pth
+  resume: false # only load weights, don't resume training state
+
 mode: train
 
 dataset:
@@ -22,7 +26,7 @@ dataset:
   roots: [/project/winston/datasets/DFC2019/overfit/]
   image_shape: [256, 256]  # Restored to SkySplat training patch size
   near: -50.0
-  far: 300.0
+  far: 75.0
   # Additional RPC specific params if needed
 
 data_loader:
@@ -37,25 +41,30 @@ data_loader:
     num_workers: 0
 
 optimizer:
-  lr: 2e-4
-  warm_up_steps: 1000
+  lr: 2e-4  # 恢復到原始值（5e-4 導致發散）
+  warm_up_steps: 1000  # 適度的 warm-up
 
 trainer:
   num_sanity_val_steps: 0  # Skip sanity check to save memory
-  gradient_clip_val: 1.0
-  accumulate_grad_batches: 6  # Accumulate gradients to simulate larger batch
-  max_steps: 200000 # Explicitly set max_steps for OneCycleLR
+  gradient_clip_val: 0.5  # 降低到 0.5 防止梯度爆炸（原本 1.0）
+  accumulate_grad_batches: 1  # Disable accumulation for faster overfitting
+  val_check_interval: 100  # Validate every 100 steps
+  check_val_every_n_epoch: null # Required for step-based validation on small datasets
+  max_steps: 500000 # Explicitly set max_steps for OneCycleLR
 
 model:
   encoder:
     d_feature: 128  # Keep 128 to match pretrained weights
     costvolume_unet_feat_dim: 128  # Restore to 128
     depth_unet_feat_dim: 64  # Restore to 64
-    num_depth_candidates: 64  # Set to 64 as per SkySplat paper
+    num_depth_candidates: 32  # 減少深度平面加速（原 64）
     wo_backbone_cross_attn: false  # Enable cross-view attention
-    wo_depth_refine: false
+    wo_depth_refine: false # Re-enable U-Net for refinement
     wo_cost_volume: false
     gaussians_per_pixel: 1  # Keep at 1
 
-checkpointing:
+train_cfg:
+  extended_visualization: true
+  depth_mode: null
+  print_log_every_n_steps: 1
   save_every_n_steps: 100

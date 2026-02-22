@@ -2,7 +2,7 @@ defaults:
   - view_sampler: bounded
 
 name: dfc2019
-roots: [/project/winston/datasets/DFC2019/skysplat_version/]
+roots: [/project/winston/datasets/DFC2019/overfit/]
 make_baseline_1: false
 augment: false
 
@@ -15,7 +15,7 @@ max_fov: 100.0
 
 skip_bad_shape: true
 near: -50.0
-far: 300.0
+far: 75.0
 baseline_scale_bounds: true
 shuffle_val: true
 test_len: -1

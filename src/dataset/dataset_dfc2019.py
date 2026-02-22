@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from .types import UnbatchedExample, UnbatchedViews
 from .view_sampler import ViewSampler
 from .dataset import DatasetCfgCommon
+# 請確保路徑跟你訓練程式碼裡寫的一模一樣
 
 @dataclass
 class DatasetDFC2019Cfg(DatasetCfgCommon):
@@ -57,44 +58,30 @@ class DFC2019Dataset(Dataset):
     def __len__(self):
         # One epoch = visiting each scene once (random sampling within scene)
         return len(self.scenes)
-    
     def _parse_rpc(self, ds) -> np.ndarray:
-        # Get RPC metadata
-        md = ds.GetMetadata('RPC')
-        if not md:
-            # Fallback or zeros?
-            return np.zeros(90, dtype=np.float32)
-
-        # Keys we expect
-        keys = [
-            'LINE_OFF', 'LINE_SCALE', 'SAMP_OFF', 'SAMP_SCALE',
-            'LAT_OFF', 'LAT_SCALE', 'LONG_OFF', 'LONG_SCALE',
-            'HEIGHT_OFF', 'HEIGHT_SCALE'
-        ]
+        # 使用 float64 以保證精度
+        keys = ['LINE_OFF', 'LINE_SCALE', 'SAMP_OFF', 'SAMP_SCALE',
+                'LAT_OFF', 'LAT_SCALE', 'LONG_OFF', 'LONG_SCALE',
+                'HEIGHT_OFF', 'HEIGHT_SCALE']
         coeffs = []
         for k in keys:
-            coeffs.append(float(md.get(k, 0)))
-            
-        # Vectors
+            # 強制從 Metadata 讀取我們寫入的數值
+            val = ds.GetMetadataItem(k, 'RPC') 
+            if val is None: val = ds.GetMetadata('RPC').get(k, 0)
+            coeffs.append(float(val))
         for prefix in ['LINE_NUM_COEFF', 'LINE_DEN_COEFF', 'SAMP_NUM_COEFF', 'SAMP_DEN_COEFF']:
-            # The value is a string with space separated numbers
-            val_str = md.get(prefix, "")
+            val_str = ds.GetMetadataItem(prefix, 'RPC')
+            if val_str is None: val_str = ds.GetMetadata('RPC').get(prefix, "")
             vals = [float(x) for x in val_str.split()]
-            # Ensure it is 20
-            if len(vals) != 20:
-                vals = vals + [0]*(20-len(vals))
-            coeffs.extend(vals)
+            coeffs.extend(vals if len(vals) == 20 else vals + [0.0]*(20-len(vals)))
             
-        return np.array(coeffs, dtype=np.float32)
+        return np.array(coeffs, dtype=np.float64)
 
     def __getitem__(self, index):
         scene_dir = self.scenes[index]
         files = sorted(list(scene_dir.glob("*.tif")))
-        
         if len(files) < 4:
             # Need at least 3 context + 1 target
-            # Fallback to random other scene or error?
-            # recursive retry
             return self.__getitem__((index + 1) % len(self))
             
         # SkySplat Sparse Input Condition: 3 input views
@@ -118,51 +105,25 @@ class DFC2019Dataset(Dataset):
         # Helper to load
         def load_view(idx):
             fpath = files[idx]
-            # Load Image
             ds = gdal.Open(str(fpath))
-            if ds is None:
-                raise IOError(f"Could not open {fpath}")
-            
-            orig_w = ds.RasterXSize
-            orig_h = ds.RasterYSize
-            
+            orig_w, orig_h = ds.RasterXSize, ds.RasterYSize
             target_h, target_w = self.cfg.image_shape
             
-            # Read bands (assuming RGB)
-            # DFC2019 might be uint8 or uint16.
-            # MVSplat expects float [0,1] tensors
-            # Load directly into target size for memory efficiency
-            arr = ds.ReadAsArray(buf_xsize=target_w, buf_ysize=target_h) # [C, H, W]
-            if arr.shape[0] > 3:
-                arr = arr[:3] # RGB
+            # 讀取影像並轉為 float32 (影像不需要 float64)
+            arr = ds.ReadAsArray(buf_xsize=target_w, buf_ysize=target_h)
+            if arr.shape[0] > 3: arr = arr[:3]
             
-            # Normalize
             if arr.dtype == np.uint8:
-                arr = arr.astype(np.float32) / 255.0
-            elif arr.dtype == np.uint16:
-                arr = arr.astype(np.float32) / 65535.0 # Or specific max
+                tensor_img = torch.from_numpy(arr).float() / 255.0
+            else:
+                tensor_img = torch.from_numpy(arr).float() / 65535.0
             
-            tensor_img = torch.from_numpy(arr)
-            
-            # Parse RPC
+            # 解析 RPC (精確度關鍵)
             rpc_coeff = self._parse_rpc(ds)
             
-            # Scale RPC to match the resized image
-            scale_h = target_h / float(orig_h)
-            scale_w = target_w / float(orig_w)
-            
-            # rpcs is [90]
-            # 0: LINE_OFF, 1: LINE_SCALE
-            rpc_coeff[0] *= scale_h
-            rpc_coeff[1] *= scale_h
-            
-            # 2: SAMP_OFF, 3: SAMP_SCALE
-            rpc_coeff[2] *= scale_w
-            rpc_coeff[3] *= scale_w
-            
-            rpc_tensor = torch.from_numpy(rpc_coeff)
-            
-            return tensor_img, rpc_tensor
+            # 轉回 Tensor (必須保持 float64 以避免精度丟失)
+            rpc_tensor = torch.from_numpy(rpc_coeff).double()
+            return tensor_img, rpc_tensor # 確保回傳兩個值！
 
         context_images, context_rpcs = [], []
         target_images, target_rpcs = [], []
@@ -185,15 +146,16 @@ class DFC2019Dataset(Dataset):
         
         # Images are already resized in load_view
             
-        # Dummy extrinsics/intrinsics/near/far
+        # Define dimensions and placeholders
         V, C, H, W = images.shape
         extrinsics = torch.eye(4).unsqueeze(0).repeat(V, 1, 1)
         intrinsics = torch.eye(3).unsqueeze(0).repeat(V, 1, 1)
-        near = torch.ones(V) * -50.0  
-        far = torch.ones(V) * 300.0   
         
-        indices = torch.arange(V) # Dummy indices relative to this batch
-
+        # Use RPC Heights for building range: offset -20 to +50 meters
+        ref_h_off = rpcs[0, 8].item() # HEIGHT_OFF is at index 8 of DFC2019 RPC
+        near = torch.ones(V) * (ref_h_off - 20.0)
+        far = torch.ones(V) * (ref_h_off + 50.0)
+        indices = torch.arange(V)
         # Construct views
         # Split back to context and target
         # Indices in 'images' stack: 0..2 are context, 3 is target

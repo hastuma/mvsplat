@@ -39,41 +39,56 @@ class LocalLogger(Logger):
         # Write metrics to CSV file
         if not metrics:
             return
-        
+
         # Add step to metrics
         metrics_with_step = {"step": step, **metrics}
-        
+
         # Check if we need to initialize or update CSV headers
         new_fields = set(metrics_with_step.keys()) - self._fieldnames
         if new_fields or self._csv_writer is None:
             self._fieldnames.update(metrics_with_step.keys())
-            
-            # Read existing data if file exists
             existing_data = []
             if self.metrics_file.exists():
-                with open(self.metrics_file, 'r') as f:
+                with open(self.metrics_file, "r") as f:
                     reader = csv.DictReader(f)
                     existing_data = list(reader)
-            
-            # Close old file if open
             if self._csv_file is not None:
                 self._csv_file.close()
-            
-            # Rewrite with new headers
-            self._csv_file = open(self.metrics_file, 'w', newline='')
+
+            self._csv_file = open(self.metrics_file, "w", newline="")
+            self.sorted_fields = sorted(self._fieldnames)
             self._csv_writer = csv.DictWriter(
-                self._csv_file, 
-                fieldnames=sorted(self._fieldnames)
+                self._csv_file, fieldnames=self.sorted_fields
             )
             self._csv_writer.writeheader()
-            
-            # Write back existing data
             for row in existing_data:
                 self._csv_writer.writerow(row)
-        
-        # Write the new metrics
+
+            # Initialize or refresh text file with headers
+            self.metrics_txt = self.output_dir / "metrics.txt"
+            with open(self.metrics_txt, "w") as f:
+                header_str = " | ".join(
+                    f"{str(field):>15}" for field in self.sorted_fields
+                )
+                f.write(header_str + "\n")
+                f.write("-" * len(header_str) + "\n")
+
+        # Write CSV
         self._csv_writer.writerow(metrics_with_step)
         self._csv_file.flush()
+
+        # Write Pretty Text
+        with open(self.output_dir / "metrics.txt", "a") as f:
+
+            def format_val(v):
+                if isinstance(v, (int, float)):
+                    return f"{v:15.6f}"
+                return f"{str(v):>15}"
+
+            row_str = " | ".join(
+                format_val(metrics_with_step.get(f, "")) for f in self.sorted_fields
+            )
+            f.write(row_str + "\n")
 
     @rank_zero_only
     def log_image(
@@ -102,6 +117,6 @@ class LocalLogger(Logger):
             if isinstance(name_part, str):
                 name_part = "".join(c for c in name_part if c.isalnum() or c in ('_', '-'))
 
-            path = LOG_PATH / f"{key}/{step:0>6}_{name_part}.png"
+            path = self.output_dir / f"{key}/{step:0>6}_{name_part}.png"
             path.parent.mkdir(exist_ok=True, parents=True)
             Image.fromarray(image).save(path)

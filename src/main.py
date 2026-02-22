@@ -1,4 +1,6 @@
 import os
+import sys
+import logging
 
 # Workaround for internal PyTorch assert error (Allocator crash)
 # Must be set BEFORE everything else.
@@ -35,14 +37,20 @@ from pytorch_lightning.loggers.wandb import WandbLogger
 
 
 ##traininig 
+# 按照指令順序的lr 
+# 2026-01-30/22-15-37  :2e-4  /batch 3
+# 2026-01-31/02-49-20  :2e-3 /batch 3
+# 2026-01-31/02-51-01  :2e-2 /batch 3
+# 2026-01-31/02-54-19  :1e-1 /batch 3
 
 
+# conda activate mvsplat && cd mvsplat 
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
 # source /project/winston/miniconda3/bin/activate mvsplat   && CUDA_VISIBLE_DEVICES=1 python -m src.main +experiment=dfc2019
 # PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False,max_split_size_mb:128" CUDA_VISIBLE_DEVICES=0,1 python -m src.main +experiment=dfc2019
 # CUDA_VISIBLE_DEVICES=4 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=1
-# CUDA_VISIBLE_DEVICES=9 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=2
-#  CUDA_VISIBLE_DEVICES=1 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=1
+# CUDA_VISIBLE_DEVICES=8 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=2
+# CUDA_VISIBLE_DEVICES=5 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=3
 # Configure beartype and jaxtyping.
 with install_import_hook(
     ("src",),
@@ -85,6 +93,11 @@ def train(cfg_dict: DictConfig):
     latest_run = output_dir.parents[1] / "latest-run"
     os.system(f"rm {latest_run}")
     os.system(f"ln -s {output_dir} {latest_run}")
+
+    # Log command and config.
+    log = logging.getLogger(__name__)
+    log.info(f"Command: {' '.join(sys.argv)}")
+    log.info(f"Config:\n{OmegaConf.to_yaml(cfg_dict)}")
 
     # Set up logging with wandb.
     callbacks = []
@@ -139,11 +152,12 @@ def train(cfg_dict: DictConfig):
         strategy="ddp" if torch.cuda.device_count() > 1 else "auto",
         callbacks=callbacks,
         val_check_interval=cfg.trainer.val_check_interval,
+        check_val_every_n_epoch=getattr(cfg.trainer, "check_val_every_n_epoch", 1),
         enable_progress_bar=True,
         gradient_clip_val=cfg.trainer.gradient_clip_val,
         max_steps=cfg.trainer.max_steps,
         num_sanity_val_steps=cfg.trainer.num_sanity_val_steps,
-        precision="32",  # Use full precision as requested by user
+        precision="32",  
         accumulate_grad_batches=getattr(cfg.trainer, 'accumulate_grad_batches', 1),
     )
     torch.manual_seed(cfg_dict.seed + trainer.global_rank)
@@ -159,16 +173,17 @@ def train(cfg_dict: DictConfig):
         "decoder": get_decoder(cfg.model.decoder, cfg.dataset),
         "losses": get_losses(cfg.loss),
         "step_tracker": step_tracker,
+        "output_dir": output_dir,
     }
+    model_wrapper = ModelWrapper(**model_kwargs)
+    
     if cfg.mode == "train" and checkpoint_path is not None and not cfg.checkpointing.resume:
-        # Just load model weights, without optimizer states
-        # e.g., fine-tune from the released weights on other datasets
-        model_wrapper = ModelWrapper.load_from_checkpoint(
-            checkpoint_path, **model_kwargs, strict=True)
-        print(cyan(f"Loaded weigths from {checkpoint_path}."))
-    else:
-        model_wrapper = ModelWrapper(**model_kwargs)
-
+        # Load raw state dict for fine-tuning
+        state_dict = torch.load(checkpoint_path, map_location="cpu")
+        if "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+        model_wrapper.load_state_dict(state_dict, strict=False)
+        print(cyan(f"Loaded weights from {checkpoint_path}."))
     data_module = DataModule(
         cfg.dataset,
         cfg.data_loader,
@@ -190,7 +205,5 @@ def train(cfg_dict: DictConfig):
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
     # torch.set_float32_matmul_precision('high')
-
     torch.backends.cudnn.benchmark = False
-    
     train()

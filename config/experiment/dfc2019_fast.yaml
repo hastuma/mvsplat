@@ -1,0 +1,74 @@
+# @package _global_
+# 快速測試版本 - 模型縮小約 4x 以加速 overfitting 測試
+
+defaults:
+  - override /dataset: dfc2019
+  - override /model/encoder: costvolume
+  - override /model/decoder: splatting_cuda
+  - override /loss: [mse, lpips]
+
+wandb:
+  mode: disabled
+
+checkpointing:
+  # 注意：縮小的模型可能無法完美載入原始權重
+  # 設為 null 從頭開始訓練，或保持 load 但接受部分載入
+  load: null  # 從頭訓練（因為維度不匹配）
+  resume: false
+
+mode: train
+
+dataset:
+  view_sampler:
+    name: bounded
+    num_context_views: 3
+    num_target_views: 1
+  roots: [/project/winston/datasets/DFC2019/overfit/]
+  image_shape: [128, 128]  # 縮小到 128x128（原本 256x256）
+  near: -50.0
+  far: 75.0
+
+data_loader:
+  train:
+    batch_size: 1
+    num_workers: 0
+  val:
+    batch_size: 1
+    num_workers: 0
+  test:
+    batch_size: 1
+    num_workers: 0
+
+optimizer:
+  lr: 2e-4
+  warm_up_steps: 50  # 更短的 warm-up
+
+trainer:
+  num_sanity_val_steps: 0
+  gradient_clip_val: 0.5
+  accumulate_grad_batches: 1
+  val_check_interval: 100
+  check_val_every_n_epoch: null
+  max_steps: 50000
+
+model:
+  encoder:
+    # ===== 縮小的模型參數 =====
+    d_feature: 64  # 從 128 降到 64
+    costvolume_unet_feat_dim: 64  # 從 128 降到 64
+    depth_unet_feat_dim: 32  # 從 64 降到 32
+    num_depth_candidates: 32  # 從 64 降到 32
+    
+    wo_backbone_cross_attn: false
+    wo_depth_refine: false
+    wo_cost_volume: false
+    gaussians_per_pixel: 1
+    
+  gaussian_adapter:
+    sh_degree: 1  # 從 4 降到 1（25 個係數 → 4 個係數）
+
+train_cfg:
+  extended_visualization: true
+  depth_mode: null
+  print_log_every_n_steps: 1
+  save_every_n_steps: 50  # 更頻繁保存

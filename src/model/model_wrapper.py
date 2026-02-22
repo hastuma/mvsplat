@@ -17,7 +17,7 @@ import json
 from ..dataset.data_module import get_data_shim
 from ..dataset.types import BatchedExample
 from ..dataset import DatasetCfg
-from ..evaluation.metrics import compute_lpips, compute_psnr, compute_ssim
+from ..evaluation.metrics import compute_lpips, compute_ssim
 from ..global_cfg import get_cfg
 from ..loss import Loss
 from ..misc.benchmarker import Benchmarker
@@ -87,6 +87,7 @@ class ModelWrapper(LightningModule):
     test_cfg: TestCfg
     train_cfg: TrainCfg
     step_tracker: StepTracker | None
+    output_dir: Path
 
     def __init__(
         self,
@@ -98,19 +99,19 @@ class ModelWrapper(LightningModule):
         decoder: Decoder,
         losses: list[Loss],
         step_tracker: StepTracker | None,
+        output_dir: Path,
     ) -> None:
         super().__init__()
         self.optimizer_cfg = optimizer_cfg
         self.test_cfg = test_cfg
         self.train_cfg = train_cfg
-        self.step_tracker = step_tracker
-
-        # Set up the model.
         self.encoder = encoder
         self.encoder_visualizer = encoder_visualizer
         self.decoder = decoder
-        self.data_shim = get_data_shim(self.encoder)
         self.losses = nn.ModuleList(losses)
+        self.step_tracker = step_tracker
+        self.output_dir = output_dir
+        self.data_shim = get_data_shim(self.encoder)
 
         # This is used for testing.
         self.benchmarker = Benchmarker()
@@ -125,33 +126,260 @@ class ModelWrapper(LightningModule):
         _, _, _, h, w = batch["target"]["image"].shape
 
         # Run the model.
-        gaussians = self.encoder(
+        # Ensure Target Extrinsics match the RPC coordinate system defined by Context
+        if "rpc" in batch["context"] and "rpc" in batch["target"]:
+            from ..geometry.rpc import RPC
+            b_ctx, v_ctx, _ = batch["context"]["rpc"].shape
+            b_tgt, v_tgt, _ = batch["target"]["rpc"].shape
+            
+            # 計算 context 第一視角圖像中心的真實經緯度作為 ENU 參考點
+            rpc_first = RPC(batch["context"]["rpc"][:, 0, :])  # [B, 90]
+            h_center_ref = batch["context"]["rpc"][:, 0, 8]   # HEIGHT_OFF 作為高度
+            u_center = torch.full_like(h_center_ref, h / 2.0)
+            v_center = torch.full_like(h_center_ref, w / 2.0)
+            lat_ref_origin, lon_ref_origin = rpc_first.inverse(u_center, v_center, h_center_ref)  # [B]
+            
+            # Expand to matches Target (B * V_tgt)
+            lat_ref_flat = lat_ref_origin.repeat_interleave(v_tgt)
+            lon_ref_flat = lon_ref_origin.repeat_interleave(v_tgt)
+            
+            rpc_target_flat = RPC(rearrange(batch["target"]["rpc"], "b v c -> (b v) c"))
+            
+            # The RPCs in this dataset are already adjusted for the 256x256 crops.
+            # We use the actual image resolution (h, w) as the reference for geometry.
+            distance = 100.0  # 相機高度 100 米
+            K_tgt, c2w_tgt = rpc_target_flat.compute_camera_geometry(h, w, lat_ref_flat, lon_ref_flat, distance=distance)
+            
+            # Since RPC and Image are both (h, w), no further scaling of K is needed for projection.
+            # Just ensure the batch is updated with these consistent matrices.
+            batch["target"]["extrinsics"] = rearrange(c2w_tgt, "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
+            batch["target"]["intrinsics"] = rearrange(K_tgt, "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
+            print(type(batch["context"]))
+            # print(batch["context"])
+            print(batch["context"]["image"].shape)
+        # greger = input("Press Enter to continue...")
+        gaussians, vis_dump = self.encoder(
             batch["context"], self.global_step, False, scene_names=batch["scene"]
         )
+        
+        # ============================================================
+        # [RENDER DEBUG] 詳細輸出相機和 Gaussian 參數
+        # ============================================================
+        if self.global_step % 10 == 0:
+            print("\n" + "=" * 70)
+            print("🎥 [RENDER DEBUG] 渲染參數詳細分析")
+            print("=" * 70)
+            
+            # 1. Target Camera 參數
+            tgt_ext = batch["target"]["extrinsics"][0, 0]  # 第一個 batch, 第一個 target view
+            tgt_int = batch["target"]["intrinsics"][0, 0]
+            tgt_near = batch["target"]["near"][0, 0]
+            tgt_far = batch["target"]["far"][0, 0]
+            
+            print("\n📷 Target Camera (用於渲染):")
+            print(f"   位置 (c2w[:3,3]): [{tgt_ext[0,3].item():.2f}, {tgt_ext[1,3].item():.2f}, {tgt_ext[2,3].item():.2f}]")
+            print(f"   焦距 (fx, fy): [{tgt_int[0,0].item():.2f}, {tgt_int[1,1].item():.2f}]")
+            print(f"   主點 (cx, cy): [{tgt_int[0,2].item():.2f}, {tgt_int[1,2].item():.2f}]")
+            print(f"   near/far: [{tgt_near.item():.2f}, {tgt_far.item():.2f}]")
+            
+            # 計算 FOV
+            import math
+            fx = tgt_int[0,0].item()
+            fy = tgt_int[1,1].item()
+            fov_x = 2 * math.atan(h / (2 * fx)) * 180 / math.pi
+            fov_y = 2 * math.atan(w / (2 * fy)) * 180 / math.pi
+            print(f"   FOV (度): [{fov_x:.2f}, {fov_y:.2f}]")
+            
+            # 2. Gaussian 參數
+            g_means = gaussians.means  # [B, N, 3] after flatten
+            # Flatten all views
+            g_means_flat = g_means.view(-1, 3)
+            print(f"\n🔵 Gaussians 位置:")
+            print(f"   總數: {g_means_flat.shape[0]}")
+            print(f"   X: min={g_means_flat[:,0].min().item():.2f}, max={g_means_flat[:,0].max().item():.2f}, mean={g_means_flat[:,0].mean().item():.2f}")
+            print(f"   Y: min={g_means_flat[:,1].min().item():.2f}, max={g_means_flat[:,1].max().item():.2f}, mean={g_means_flat[:,1].mean().item():.2f}")
+            print(f"   Z: min={g_means_flat[:,2].min().item():.2f}, max={g_means_flat[:,2].max().item():.2f}, mean={g_means_flat[:,2].mean().item():.2f}")
+            
+            # 3. 計算相機是否能看到 Gaussians
+            cam_pos = tgt_ext[:3, 3]
+            gs_center = g_means_flat.mean(dim=0)
+            cam_to_gs = gs_center - cam_pos
+            distance_cam_to_gs = torch.norm(cam_to_gs).item()
+            
+            print(f"\n📏 相機與 Gaussians 的關係:")
+            print(f"   相機位置: [{cam_pos[0].item():.2f}, {cam_pos[1].item():.2f}, {cam_pos[2].item():.2f}]")
+            print(f"   Gaussians 中心: [{gs_center[0].item():.2f}, {gs_center[1].item():.2f}, {gs_center[2].item():.2f}]")
+            print(f"   距離: {distance_cam_to_gs:.2f} 米")
+            
+            # 相機朝向（假設 Z 軸是前方）
+            cam_forward = tgt_ext[:3, 2]  # c2w 的第三列是相機的 Z 軸方向
+            print(f"   相機朝向 (Z軸): [{cam_forward[0].item():.4f}, {cam_forward[1].item():.4f}, {cam_forward[2].item():.4f}]")
+            
+            # 檢查相機高度 vs Gaussian 高度
+            cam_z = cam_pos[2].item()
+            gs_z_min = g_means_flat[:,2].min().item()
+            gs_z_max = g_means_flat[:,2].max().item()
+            print(f"\n⚠️ 高度對齊檢查:")
+            print(f"   相機高度 (Z): {cam_z:.2f}")
+            print(f"   Gaussians 高度範圍: [{gs_z_min:.2f}, {gs_z_max:.2f}]")
+            
+            if cam_z < gs_z_min:
+                print(f"   ❌ 相機在 Gaussians 下方！")
+            elif cam_z > gs_z_max:
+                print(f"   ℹ️ 相機在 Gaussians 上方 (這是預期的，因為是俯視)")
+            else:
+                print(f"   ⚠️ 相機在 Gaussians 範圍內")
+            
+            # 4. 計算 Gaussians 是否在視錐體內
+            # 簡單檢查：在相機座標系中，Gaussians 應該在 near-far 範圍內
+            w2c = torch.inverse(tgt_ext)  # world to camera
+            gs_in_cam = (w2c[:3, :3] @ g_means_flat.T + w2c[:3, 3:4]).T  # [N, 3]
+            gs_depths = gs_in_cam[:, 2]  # 在相機座標系中的 Z（深度）
+            
+            print(f"\n📊 Gaussians 在相機座標系中的深度:")
+            print(f"   深度範圍: [{gs_depths.min().item():.2f}, {gs_depths.max().item():.2f}]")
+            print(f"   near/far: [{tgt_near.item():.2f}, {tgt_far.item():.2f}]")
+            
+            in_frustum_depth = (gs_depths > tgt_near) & (gs_depths < tgt_far)
+            print(f"   在 near-far 內的 Gaussians: {in_frustum_depth.sum().item()}/{len(gs_depths)} ({in_frustum_depth.sum().item()/len(gs_depths)*100:.1f}%)")
+            
+            # 檢查負深度（在相機後面）
+            behind_camera = gs_depths < 0
+            print(f"   ❌ 在相機後面的 Gaussians: {behind_camera.sum().item()}/{len(gs_depths)} ({behind_camera.sum().item()/len(gs_depths)*100:.1f}%)")
+            
+            print("=" * 70 + "\n")
+        
+        # ============================================================
+        # [CRITICAL FIX] 動態計算渲染器需要的 near/far
+        # 使用 RPC 參數計算相機和場景之間的實際距離
+        # ============================================================
+        if "rpc" in batch["context"]:
+            # 從 RPC 參數取得場景高度範圍
+            h_off = batch["context"]["rpc"][:, 0, 8]    # HEIGHT_OFF [B]
+            h_scale = batch["context"]["rpc"][:, 0, 9]  # HEIGHT_SCALE [B]
+            distance = 100.0  # 虛擬相機高度
+            
+            # 場景高度範圍（MSL 絕對高度）
+            scene_z_min = h_off - h_scale  # 最低高度
+            scene_z_max = h_off + h_scale  # 最高高度
+            
+            # 相機高度（MSL 絕對高度）
+            camera_z = h_off + distance
+            
+            # 相機座標系的 near/far（相機到場景的距離）
+            margin = 10.0  # 額外邊界避免裁剪
+            render_near = (camera_z - scene_z_max - margin).clamp(min=1.0)
+            render_far = (camera_z - scene_z_min + margin).clamp(min=render_near + 1.0)
+            
+            # 擴展到 [B, V] 形狀
+            b_tgt, v_tgt = batch["target"]["extrinsics"].shape[:2]
+            render_near = render_near.unsqueeze(1).expand(b_tgt, v_tgt)
+            render_far = render_far.unsqueeze(1).expand(b_tgt, v_tgt)
+            
+            if self.global_step % 50 == 0:
+                print(f"\n🔧 [RENDER NEAR/FAR] model_wrapper")
+                print(f"   HEIGHT_OFF: {h_off[0].item():.1f}, HEIGHT_SCALE: {h_scale[0].item():.1f}")
+                print(f"   Scene Z (MSL): [{scene_z_min[0].item():.1f}, {scene_z_max[0].item():.1f}]")
+                print(f"   Camera Z (MSL): {camera_z[0].item():.1f}")
+                print(f"   ✅ Render near/far: [{render_near[0,0].item():.1f}, {render_far[0,0].item():.1f}]")
+        else:
+            render_near = batch["target"]["near"]
+            render_far = batch["target"]["far"]
+        
         output = self.decoder.forward(
             gaussians,
             batch["target"]["extrinsics"],
             batch["target"]["intrinsics"],
-            batch["target"]["near"],
-            batch["target"]["far"],
+            render_near,
+            render_far,
             (h, w),
             depth_mode=self.train_cfg.depth_mode,
         )
         target_gt = batch["target"]["image"]
+        
+        # --- DEBUG: Save Rendered Image, Depth Maps and Log Stats ---
+        if self.global_rank == 0 and self.global_step % 10 == 0:
+            import torchvision
+            from pathlib import Path
+            import torch.nn.functional as F
+            
+            # 1. Setup Directories
+            vis_loss_dir = self.output_dir / "vis_loss"
+            vis_depth_dir = self.output_dir / "vis_depth"
+            vis_feat_dir = self.output_dir / "vis_feature"
+            vis_loss_dir.mkdir(parents=True, exist_ok=True)
+            vis_depth_dir.mkdir(parents=True, exist_ok=True)
+            vis_feat_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 2. Save RGB comparison
+            img_loss = torch.cat([target_gt[0, 0], output.color[0, 0]], dim=-1)
+            torchvision.utils.save_image(img_loss, vis_loss_dir / f"step_{self.global_step:0>6}.png")
+            
+            # 3. Save Predict Height Maps (Concatenate Low-res and High-res)
+            # Both are [Batch*View, 1, H, W]. Take the first view of the first batch.
+            d_low = vis_dump["depth_lowres"][0, 0]   # [H/4, W/4]
+            d_high = vis_dump["depth_highres"][0, 0] # [H, W]
+            
+            # Normalize for visualization [min, max] -> [0, 1]
+            d_min, d_max = d_high.min(), d_high.max()
+            if d_max > d_min:
+                d_low_norm = (d_low - d_min) / (d_max - d_min)
+                d_high_norm = (d_high - d_min) / (d_max - d_min)
+            else:
+                d_low_norm, d_high_norm = d_low * 0, d_high * 0
+                
+            # Upscale low-res for concatenation
+            d_low_up = F.interpolate(d_low_norm.unsqueeze(0).unsqueeze(0), size=(h, w), mode='nearest').squeeze()
+            depth_cat = torch.cat([d_low_up, d_high_norm], dim=-1) # [H, 2W]
+            torchvision.utils.save_image(depth_cat, vis_depth_dir / f"step_{self.global_step:0>6}.png")
+            
+            # 3.5 Save CNN Features (first 3 channels as RGB)
+            if "cnn_features" in vis_dump:
+                feat = vis_dump["cnn_features"][0, 0, :3].detach().cpu()
+                # Normalize feature for vis
+                f_min, f_max = feat.min(), feat.max()
+                feat = (feat - f_min) / (f_max - f_min + 1e-8)
+                torchvision.utils.save_image(feat, vis_feat_dir / f"step_{self.global_step:0>6}.png")
+
+            # 4. Log Detailed Stats
+            with open(self.output_dir / "training_debug.log", "a") as f:
+                f.write(f"\n--- STEP {self.global_step} ---\n")
+                if "rpc" in batch["context"]:
+                    rpc_data = batch["context"]["rpc"][0, 0].detach().cpu().numpy()
+                    f.write(f"RPC Coefficients (First Batch, First View):\n")
+                    f.write(f"{rpc_data.tolist()}\n")
+                
+                means_flat = gaussians.means.detach().reshape(-1, 3)
+                f.write(f"  Means range: min={means_flat.min().item():.2f}, max={means_flat.max().item():.2f}, std={means_flat.std(dim=0).cpu().numpy()}\n")
+                f.write(f"  Opacities: mean={gaussians.opacities.mean().item():.4f}, max={gaussians.opacities.max().item():.4f}\n")
+                
+                # SH 顏色統計
+                sh = gaussians.harmonics.detach()  # [B, N, 3, d_sh]
+                dc = sh[..., 0]  # DC component: [B, N, 3]
+                f.write(f"  SH DC (color): R={dc[..., 0].mean().item():.4f}, G={dc[..., 1].mean().item():.4f}, B={dc[..., 2].mean().item():.4f}\n")
+                f.write(f"  SH DC std: R={dc[..., 0].std().item():.4f}, G={dc[..., 1].std().item():.4f}, B={dc[..., 2].std().item():.4f}\n")
+                
+                f.write(f"  Target Extrinsics Trans: {batch['target']['extrinsics'][0, 0, :3, 3].cpu().numpy()}\n")
+                f.write(f"  Near/Far: {batch['target']['near'][0, 0].item():.2f} / {batch['target']['far'][0, 0].item():.2f}\n")
+                f.write(f"  Depth Range in Dump: {d_min.item():.2f} ~ {d_max.item():.2f}\n")
 
         # Compute metrics.
-        psnr_probabilistic = compute_psnr(
-            rearrange(target_gt, "b v c h w -> (b v) c h w"),
-            rearrange(output.color, "b v c h w -> (b v) c h w"),
-        )
-        self.log("train/psnr_probabilistic", psnr_probabilistic.mean())
-
         # Compute and log loss.
         total_loss = 0
         for loss_fn in self.losses:
             loss = loss_fn.forward(output, batch, gaussians, self.global_step)
             self.log(f"loss/{loss_fn.name}", loss)
             total_loss = total_loss + loss
+        
+        # Opacity regularization: 防止所有 Gaussian 變透明（opacity → 0）
+        # 確保平均 opacity 保持在合理範圍（至少 0.3）
+        opacity_mean = gaussians.opacities.mean()
+        opacity_reg_weight = 0.1
+        opacity_target = 0.3
+        opacity_reg = opacity_reg_weight * torch.relu(opacity_target - opacity_mean)
+        total_loss = total_loss + opacity_reg
+        self.log("loss/opacity_reg", opacity_reg)
+        
         self.log("loss/total", total_loss)
 
         if (
@@ -164,6 +392,75 @@ class ModelWrapper(LightningModule):
                 f"far = {batch['context']['far'].detach().cpu().numpy().mean():.2f}; "
                 f"loss = {total_loss:.6f}"
             )
+            
+            # Debug: Check Gradients and Flow
+            # 注意：這個檢查是在 backward 之前執行的，所以它看到的是「上一個 step」的 gradient。
+            # 在 validation interval 之後，gradient 可能被清空，這是正常的。
+            if self.global_step > 0 and self.global_step % 10 == 0:
+                print(f"--- Gradient Check (Step {self.global_step}, from previous backward) ---")
+                grad_stats = {}
+                for name, param in self.encoder.named_parameters():
+                    if param.grad is not None:
+                        g_max = param.grad.abs().max().item()
+                        if g_max > 1e-12:
+                            layer_name = name.split('.')[0] if '.' in name else name
+                            if layer_name not in grad_stats:
+                                grad_stats[layer_name] = {'count': 0, 'max': 0}
+                            grad_stats[layer_name]['count'] += 1
+                            grad_stats[layer_name]['max'] = max(grad_stats[layer_name]['max'], g_max)
+                
+                if grad_stats:
+                    print(" Gradient Flow by Layer:")
+                    for layer, stats in grad_stats.items():
+                        print(f"   {layer}: {stats['count']} params, max_grad={stats['max']:.2e}")
+                else:
+                    # 在 validation interval 後 gradient 被清空是正常的
+                    print(" INFO: No gradients from previous step (normal after validation or optimizer.step)")
+
+            # --- Mandatory 3DGS PLY Export for Debugging ---
+            if self.global_step % 50 == 0:
+                from .ply_export import export_ply
+                ply_dir = self.output_dir / "gaussians_ply"
+                ply_dir.mkdir(parents=True, exist_ok=True)
+                ply_path = ply_dir / f"step_{self.global_step:0>6}.ply"
+                
+                # Gaussians object returned by the encoder is already flattened [B, N, ...]
+                b_idx = 0
+                means = gaussians.means[b_idx]
+                scales = gaussians.scales[b_idx]
+                rotations = gaussians.rotations[b_idx]
+                opacities = gaussians.opacities[b_idx] # Should be 1D (N)
+                sh = gaussians.harmonics[b_idx]        # Should be (N, 3, D_SH)
+                
+                export_ply(
+                    batch["target"]["extrinsics"][b_idx, 0], # Reference camera
+                    means,
+                    scales,
+                    rotations,
+                    sh, 
+                    opacities,
+                    ply_path
+                )
+                print(f" [SAVE] Saved 3DGS PLY to: {ply_path}")
+                
+                # 額外保存完整 3DGS 數據為 .pt 格式（方便 Python 分析）
+                pt_path = ply_dir / f"step_{self.global_step:0>6}_full.pt"
+                gaussians_data = {
+                    "means": means.detach().cpu(),           # [N, 3] 位置
+                    "scales": scales.detach().cpu(),         # [N, 3] 大小
+                    "rotations": rotations.detach().cpu(),   # [N, 4] 四元數
+                    "opacities": opacities.detach().cpu(),   # [N] 透明度
+                    "harmonics": sh.detach().cpu(),          # [N, 3, D_SH] SH 係數
+                    "covariances": gaussians.covariances[b_idx].detach().cpu(),  # [N, 3, 3]
+                    # 額外資訊
+                    "step": self.global_step,
+                    "scene": batch["scene"][b_idx] if "scene" in batch else "unknown",
+                    "target_extrinsics": batch["target"]["extrinsics"][b_idx].detach().cpu(),
+                    "context_extrinsics": batch["context"]["extrinsics"][b_idx].detach().cpu(),
+                }
+                torch.save(gaussians_data, pt_path)
+                print(f" [SAVE] Saved full 3DGS data to: {pt_path}")
+
         self.log("info/near", batch["context"]["near"].detach().cpu().numpy().mean())
         self.log("info/far", batch["context"]["far"].detach().cpu().numpy().mean())
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor
@@ -179,12 +476,39 @@ class ModelWrapper(LightningModule):
         b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
 
+        # Fix Target Camera (Same as Training)
+        if "rpc" in batch["context"] and "rpc" in batch["target"]:
+            from ..geometry.rpc import RPC
+            b_ctx, v_ctx, _ = batch["context"]["rpc"].shape
+            b_tgt, v_tgt, _ = batch["target"]["rpc"].shape
+            
+            # 計算 context 第一視角圖像中心的真實經緯度作為 ENU 參考點
+            rpc_first = RPC(batch["context"]["rpc"][:, 0, :])  # [B, 90]
+            h_center_ref = batch["context"]["rpc"][:, 0, 8]   # HEIGHT_OFF 作為高度
+            u_center = torch.full_like(h_center_ref, h / 2.0)
+            v_center = torch.full_like(h_center_ref, w / 2.0)
+            lat_ref_origin, lon_ref_origin = rpc_first.inverse(u_center, v_center, h_center_ref)  # [B]
+            
+            lat_ref_flat = lat_ref_origin.repeat_interleave(v_tgt)
+            lon_ref_flat = lon_ref_origin.repeat_interleave(v_tgt)
+            
+            rpc_target_flat = RPC(rearrange(batch["target"]["rpc"], "b v c -> (b v) c"))
+            h_orig, w_orig = 1024, 1024
+            distance = 100.0  # 相機高度 100 米
+            K_tgt, c2w_tgt = rpc_target_flat.compute_camera_geometry(h_orig, w_orig, lat_ref_flat, lon_ref_flat, distance=distance)
+            
+            # Scale Intrinsics
+            scale_model = h / h_orig
+            K_tgt_model = K_tgt.clone()
+            K_tgt_model[:, :2, :] *= scale_model
+            
+            batch["target"]["extrinsics"] = rearrange(c2w_tgt, "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
+            batch["target"]["intrinsics"] = rearrange(K_tgt_model, "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
+
         # Render Gaussians.
         with self.benchmarker.time("encoder"):
-            gaussians = self.encoder(
-                batch["context"],
-                self.global_step,
-                deterministic=False,
+            gaussians, _ = self.encoder(
+                batch["context"], self.global_step, False, scene_names=batch["scene"]
             )
 
         # Export PLY if enabled in encoder config
@@ -230,16 +554,10 @@ class ModelWrapper(LightningModule):
                 self.time_skip_steps_dict["decoder"] += v
             rgb = images_prob
 
-            if f"psnr" not in self.test_step_outputs:
-                self.test_step_outputs[f"psnr"] = []
             if f"ssim" not in self.test_step_outputs:
                 self.test_step_outputs[f"ssim"] = []
             if f"lpips" not in self.test_step_outputs:
                 self.test_step_outputs[f"lpips"] = []
-
-            self.test_step_outputs[f"psnr"].append(
-                compute_psnr(rgb_gt, rgb).mean().item()
-            )
             self.test_step_outputs[f"ssim"].append(
                 compute_ssim(rgb_gt, rgb).mean().item()
             )
@@ -295,7 +613,7 @@ class ModelWrapper(LightningModule):
         # Render Gaussians.
         b, _, _, h, w = batch["target"]["image"].shape
         assert b == 1
-        gaussians_softmax = self.encoder(
+        gaussians_softmax, _ = self.encoder(
             batch["context"],
             self.global_step,
             deterministic=False,
@@ -315,43 +633,41 @@ class ModelWrapper(LightningModule):
         for tag, rgb in zip(
             ("val",), (rgb_softmax,)
         ):
-            psnr = compute_psnr(rgb_gt, rgb).mean()
-            self.log(f"val/psnr_{tag}", psnr)
             lpips = compute_lpips(rgb_gt, rgb).mean()
             self.log(f"val/lpips_{tag}", lpips)
             ssim = compute_ssim(rgb_gt, rgb).mean()
             self.log(f"val/ssim_{tag}", ssim)
 
-        # Construct comparison image.
-        comparison = hcat(
-            add_label(vcat(*batch["context"]["image"][0]), "Context"),
-            add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
-            add_label(vcat(*rgb_softmax), "Target (Softmax)"),
-        )
-        self.logger.log_image(
-            "comparison",
-            [prep_image(add_border(comparison))],
-            step=self.global_step,
-            caption=batch["scene"],
-        )
+        # # Construct comparison image.
+        # comparison = hcat(
+        #     add_label(vcat(*batch["context"]["image"][0]), "Context"),
+        #     add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
+        #     add_label(vcat(*rgb_softmax), "Target (Softmax)"),
+        # )
+        # self.logger.log_image(
+        #     "comparison",
+        #     [prep_image(add_border(comparison))],
+        #     step=self.global_step,
+        #     caption=batch["scene"],
+        # )
 
-        # Render projections and construct projection image.
-        projections = hcat(*render_projections(
-                                gaussians_softmax,
-                                256,
-                                extra_label="(Softmax)",
-                            )[0])
-        self.logger.log_image(
-            "projection",
-            [prep_image(add_border(projections))],
-            step=self.global_step,
-        )
+        # # Render projections and construct projection image.
+        # projections = hcat(*render_projections(
+        #                         gaussians_softmax,
+        #                         256,
+        #                         extra_label="(Softmax)",
+        #                     )[0])
+        # self.logger.log_image(
+        #     "projection",
+        #     [prep_image(add_border(projections))],
+        #     step=self.global_step,
+        # )
 
-        # Draw cameras.
-        cameras = hcat(*render_cameras(batch, 256))
-        self.logger.log_image(
-            "cameras", [prep_image(add_border(cameras))], step=self.global_step
-        )
+        # # Draw cameras.
+        # cameras = hcat(*render_cameras(batch, 256))
+        # self.logger.log_image(
+        #     "cameras", [prep_image(add_border(cameras))], step=self.global_step
+        # )
 
         if self.encoder_visualizer is not None:
             for k, image in self.encoder_visualizer.visualize(
@@ -474,7 +790,7 @@ class ModelWrapper(LightningModule):
         loop_reverse: bool = True,
     ) -> None:
         # Render probabilistic estimate of scene.
-        gaussians_prob = self.encoder(batch["context"], self.global_step, False)
+        gaussians_prob, _ = self.encoder(batch["context"], self.global_step, False)
         # gaussians_det = self.encoder(batch["context"], self.global_step, True)
 
         t = torch.linspace(0, 1, num_frames, dtype=torch.float32, device=self.device)

@@ -1,31 +1,18 @@
 import torch
 from torch import Tensor
 from typing import Tuple
+import torch.nn.functional as F
 
 class RPC:
     def __init__(self, coeffs: Tensor, device=None):
         """
-        coeffs: Tensor of shape (..., 90) or similar, containing:
-            LINE_OFF, LINE_SCALE, SAMP_OFF, SAMP_SCALE,
-            LAT_OFF, LAT_SCALE, LONG_OFF, LONG_SCALE,
-            HEIGHT_OFF, HEIGHT_SCALE,
-            LINE_NUM_COEFF (20), LINE_DEN_COEFF (20),
-            SAMP_NUM_COEFF (20), SAMP_DEN_COEFF (20)
+        coeffs: Tensor of shape (..., 90)
         """
         if device is None:
             device = coeffs.device
         self.device = device
         
-        # Parse coefficients
-        # Assuming the standard order which is often:
-        # 0: LINE_OFF, 1: LINE_SCALE, 2: SAMP_OFF, 3: SAMP_SCALE
-        # 4: LAT_OFF, 5: LAT_SCALE, 6: LONG_OFF, 7: LONG_SCALE
-        # 8: HEIGHT_OFF, 9: HEIGHT_SCALE
-        # 10-29: LINE_NUM_COEFF (20)
-        # 30-49: LINE_DEN_COEFF (20)
-        # 50-69: SAMP_NUM_COEFF (20)
-        # 70-89: SAMP_DEN_COEFF (20)
-        
+        # 0-9: Offsets and Scales
         self.line_off = coeffs[..., 0]
         self.line_scale = coeffs[..., 1]
         self.samp_off = coeffs[..., 2]
@@ -37,21 +24,15 @@ class RPC:
         self.height_off = coeffs[..., 8]
         self.height_scale = coeffs[..., 9]
         
+        # 10-89: Polynomial Coefficients
         self.line_num_coeff = coeffs[..., 10:30]
         self.line_den_coeff = coeffs[..., 30:50]
         self.samp_num_coeff = coeffs[..., 50:70]
         self.samp_den_coeff = coeffs[..., 70:90]
 
     def _polynomial(self, p, l, h, coeffs):
-        # p: latitude (normalized), l: longitude (normalized), h: height (normalized)
-        # coeffs: (..., 20)
-        # p, l, h can be [..., spatial_dims] while coeffs is [batch, 20]
-        # Need to reshape coeffs to match
-        
-        # Compute spatial_dims to add
-        spatial_dims = p.ndim - (coeffs.ndim - 1)  # coeffs.ndim-1 is batch dims
-        
-        # Extract coefficients and add spatial dimensions
+        # p: lat_norm, l: lon_norm, h: height_norm
+        spatial_dims = p.ndim - (coeffs.ndim - 1)
         c = []
         for i in range(20):
             coef = coeffs[..., i]
@@ -59,150 +40,212 @@ class RPC:
                 coef = coef.view(*coef.shape, *([1] * spatial_dims))
             c.append(coef)
 
-        result = (c[0] + c[1]*l + c[2]*p + c[3]*h + c[4]*l*p + c[5]*l*h + c[6]*p*h + c[7]*l*l + c[8]*p*p + c[9]*h*h +
-                  c[10]*p*l*h + c[11]*l*l*l + c[12]*l*p*p + c[13]*l*h*h + c[14]*l*l*p + c[15]*p*p*p + c[16]*p*h*h + c[17]*l*l*h + c[18]*p*p*h + c[19]*h*h*h)
+        # GDAL / Standard RPC 20-term Polynomial:
+        # 1, l, p, h, l*p, l*h, p*h, l^2, p^2, h^2, p*l*h, l^3, l*p^2, l*h^2, l^2*p, p^3, p*h^2, l^2*h, p^2*h, h^3
+        result = (c[0] + c[1]*l + c[2]*p + c[3]*h +
+                  c[4]*l*p + c[5]*l*h + c[6]*p*h +
+                  c[7]*l*l + c[8]*p*p + c[9]*h*h +
+                  c[10]*p*l*h + c[11]*l*l*l + c[12]*l*p*p + c[13]*l*h*h + 
+                  c[14]*l*l*p + c[15]*p*p*p + c[16]*p*h*h + 
+                  c[17]*l*l*h + c[18]*p*p*h + c[19]*h*h*h)
         return result
 
     def forward(self, lat: Tensor, lon: Tensor, height: Tensor) -> Tuple[Tensor, Tensor]:
-        """
-        Project (Lat, Lon, Height) world coordinates to (Row, Col) image coordinates.
-        Input are typically tensors of shape (B, ...).
-        World coords are un-normalized (deg, deg, meters).
-        Returns (row, col) (pixel coordinates).
-        """
-        # 1. Normalize - handle multi-dimensional inputs
-        spatial_dims = lat.ndim - self.lat_off.ndim
-        lat_off = self.lat_off.view(*self.lat_off.shape, *([1] * spatial_dims))
-        lat_scale = self.lat_scale.view(*self.lat_scale.shape, *([1] * spatial_dims))
-        long_off = self.long_off.view(*self.long_off.shape, *([1] * spatial_dims))
-        long_scale = self.long_scale.view(*self.long_scale.shape, *([1] * spatial_dims))
-        height_off = self.height_off.view(*self.height_off.shape, *([1] * spatial_dims))
-        height_scale = self.height_scale.view(*self.height_scale.shape, *([1] * spatial_dims))
-        line_off = self.line_off.view(*self.line_off.shape, *([1] * spatial_dims))
-        line_scale = self.line_scale.view(*self.line_scale.shape, *([1] * spatial_dims))
-        samp_off = self.samp_off.view(*self.samp_off.shape, *([1] * spatial_dims))
-        samp_scale = self.samp_scale.view(*self.samp_scale.shape, *([1] * spatial_dims))
-        
-        P = (lat - lat_off) / lat_scale
-        L = (lon - long_off) / long_scale
-        H = (height - height_off) / height_scale
+        s = [1] * (lat.ndim - self.lat_off.ndim)
+        P = (lat - self.lat_off.view(*self.lat_off.shape, *s)) / self.lat_scale.view(*self.lat_scale.shape, *s)
+        L = (lon - self.long_off.view(*self.long_off.shape, *s)) / self.long_scale.view(*self.long_scale.shape, *s)
+        H = (height - self.height_off.view(*self.height_off.shape, *s)) / self.height_scale.view(*self.height_scale.shape, *s)
 
-        # 2. Compute polynomials
         num_l = self._polynomial(P, L, H, self.line_num_coeff)
         den_l = self._polynomial(P, L, H, self.line_den_coeff)
         num_s = self._polynomial(P, L, H, self.samp_num_coeff)
         den_s = self._polynomial(P, L, H, self.samp_den_coeff)
 
-        # 3. Calculate normalized coordinates
-        r_n = num_l / den_l
-        c_n = num_s / den_s
-
-        # 4. De-normalize to image coordinates
-        row = r_n * line_scale + line_off
-        col = c_n * samp_scale + samp_off
-
+        row = (num_l / den_l) * self.line_scale.view(*self.line_scale.shape, *s) + self.line_off.view(*self.line_off.shape, *s)
+        col = (num_s / den_s) * self.samp_scale.view(*self.samp_scale.shape, *s) + self.samp_off.view(*self.samp_off.shape, *s)
         return row, col
 
-    def inverse(self, row: Tensor, col: Tensor, height: Tensor, initial_guess: Tuple[Tensor, Tensor] = None, iterations=5) -> Tuple[Tensor, Tensor]:
-        """
-        Iterative inverse projection (Newton-Raphson or similar) from (Row, Col, Height) to (Lat, Lon).
-        Row, Col are un-normalized pixels. Height is un-normalized meters.
-        Returns (lat, lon).
-        """
-        # Normalize inputs
-        # row, col, height can be [B, D, H, W] while self params are [B]
-        # Need to reshape params to match: [B, 1, 1, 1]
+    def inverse(self, row: Tensor, col: Tensor, height: Tensor, initial_guess: Tuple[Tensor, Tensor] = None, iterations=10) -> Tuple[Tensor, Tensor]:
         spatial_dims = row.ndim - self.line_off.ndim
-        line_off = self.line_off.view(*self.line_off.shape, *([1] * spatial_dims))
-        line_scale = self.line_scale.view(*self.line_scale.shape, *([1] * spatial_dims))
-        samp_off = self.samp_off.view(*self.samp_off.shape, *([1] * spatial_dims))
-        samp_scale = self.samp_scale.view(*self.samp_scale.shape, *([1] * spatial_dims))
-        height_off = self.height_off.view(*self.height_off.shape, *([1] * spatial_dims))
-        height_scale = self.height_scale.view(*self.height_scale.shape, *([1] * spatial_dims))
-        lat_off = self.lat_off.view(*self.lat_off.shape, *([1] * spatial_dims))
-        lat_scale = self.lat_scale.view(*self.lat_scale.shape, *([1] * spatial_dims))
-        long_off = self.long_off.view(*self.long_off.shape, *([1] * spatial_dims))
-        long_scale = self.long_scale.view(*self.long_scale.shape, *([1] * spatial_dims))
+        s = [1] * spatial_dims
         
-        Rn = (row - line_off) / line_scale
-        Cn = (col - samp_off) / samp_scale
-        H = (height - height_off) / height_scale
+        orig_dtype = row.dtype
+        Rn = ((row - self.line_off.view(*self.line_off.shape, *s)) / self.line_scale.view(*self.line_scale.shape, *s)).to(torch.float64)
+        Cn = ((col - self.samp_off.view(*self.samp_off.shape, *s)) / self.samp_scale.view(*self.samp_scale.shape, *s)).to(torch.float64)
+        H = ((height - self.height_off.view(*self.height_off.shape, *s)) / self.height_scale.view(*self.height_scale.shape, *s)).to(torch.float64)
 
-        # Initial guess: use offset (0, 0) normalized, which corresponds to (lat_off, long_off)
         if initial_guess is None:
-            # normalized initial guess (0, 0)
-            P = torch.zeros_like(Rn)
-            L = torch.zeros_like(Cn)
+            P = torch.zeros_like(Rn, dtype=torch.float64)
+            L = torch.zeros_like(Cn, dtype=torch.float64)
         else:
-            lat_guess, lon_guess = initial_guess
-            P = (lat_guess - lat_off) / lat_scale
-            L = (lon_guess - long_off) / long_scale
+            lat_g, lon_g = initial_guess
+            P = ((lat_g - self.lat_off.view(*self.lat_off.shape, *s)) / self.lat_scale.view(*self.lat_scale.shape, *s)).to(torch.float64)
+            L = ((lon_g - self.long_off.view(*self.long_off.shape, *s)) / self.long_scale.view(*self.long_scale.shape, *s)).to(torch.float64)
 
-        # Newton-Raphson iteration
-        # We want to solve for P, L:
-        # f1(P, L) = NumL(P,L,H)/DenL(P,L,H) - Rn = 0
-        # f2(P, L) = NumS(P,L,H)/DenS(P,L,H) - Cn = 0
-        
+        lnc, ldc = self.line_num_coeff.to(torch.float64), self.line_den_coeff.to(torch.float64)
+        snc, sdc = self.samp_num_coeff.to(torch.float64), self.samp_den_coeff.to(torch.float64)
+
         for _ in range(iterations):
-            # Evaluate polynomials
-            # We need gradients w.r.t P and L. 
-            # PyTorch autograd can handle this easily if we just compute the forward pass and grab gradients? 
-            # But doing autograd inside a no_grad loop or optimizing logic might be slow/complex.
-            # For 5 iterations, pure autograd is fine if we are not inside a larger graph we want to backprop through?
-            # Actually, we WANT to backprop through this eventually (maybe? usually no, this is just geometry).
-            # If we need this to be differentiable for the model (e.g. if we are optimizing coordinates), we should use implicit differentiation or unrolled loop.
-            # Here we just implement unrolled loop.
-            
-            # To use autograd for Jacobian:
             with torch.enable_grad():
-                P_var = P.detach().requires_grad_(True)
-                L_var = L.detach().requires_grad_(True)
+                P_l = P.detach().requires_grad_(True)
+                L_l = L.detach().requires_grad_(True)
                 
-                num_l = self._polynomial(P_var, L_var, H, self.line_num_coeff)
-                den_l = self._polynomial(P_var, L_var, H, self.line_den_coeff)
-                num_s = self._polynomial(P_var, L_var, H, self.samp_num_coeff)
-                den_s = self._polynomial(P_var, L_var, H, self.samp_den_coeff)
+                r_hat = self._polynomial(P_l, L_l, H, lnc) / self._polynomial(P_l, L_l, H, ldc)
+                c_hat = self._polynomial(P_l, L_l, H, snc) / self._polynomial(P_l, L_l, H, sdc)
                 
-                rn_hat = num_l / den_l
-                cn_hat = num_s / den_s
+                row_grads = torch.autograd.grad(r_hat.sum(), [P_l, L_l])
+                col_grads = torch.autograd.grad(c_hat.sum(), [P_l, L_l])
                 
-                err_r = rn_hat - Rn
-                err_c = cn_hat - Cn
+                J = torch.stack([
+                    torch.stack([row_grads[0], row_grads[1]], dim=-1),
+                    torch.stack([col_grads[0], col_grads[1]], dim=-1)
+                ], dim=-2)
                 
-                # Compute Jacobian
-                # J = [[dr/dP, dr/dL], [dc/dP, dc/dL]]
-                # This construct is batched.
-                
-                # dr/dP
-                grad_r_p = torch.autograd.grad(rn_hat, P_var, grad_outputs=torch.ones_like(rn_hat), create_graph=True, retain_graph=True)[0]
-                grad_r_l = torch.autograd.grad(rn_hat, L_var, grad_outputs=torch.ones_like(rn_hat), create_graph=True, retain_graph=True)[0]
-                grad_c_p = torch.autograd.grad(cn_hat, P_var, grad_outputs=torch.ones_like(cn_hat), create_graph=True, retain_graph=True)[0]
-                grad_c_l = torch.autograd.grad(cn_hat, L_var, grad_outputs=torch.ones_like(cn_hat), create_graph=True, retain_graph=True)[0]
-                
-            # Detach gradients to stop graph growth if irrelevant, but keep for next iter if needed
-            # For pure solver we don't need graph across steps unless we want gradients of output wrt input.
-            # Assuming we might want gradients of LatLon wrt RowCol? 
-            # For now, let's stick to simple update.
-            
-            # Jacobian inverse update:
-            # [dP, dL]^T = - J^-1 * [err_r, err_c]^T
-            
-            det = grad_r_p * grad_c_l - grad_r_l * grad_c_p
-            det = det + 1e-10 # eps
-            
-            inv_j_00 = grad_c_l / det
-            inv_j_01 = -grad_r_l / det
-            inv_j_10 = -grad_c_p / det
-            inv_j_11 = grad_r_p / det
-            
-            delta_p = -(inv_j_00 * err_r + inv_j_01 * err_c)
-            delta_l = -(inv_j_10 * err_r + inv_j_11 * err_c)
-            
-            P = P_var.detach() + delta_p.detach()
-            L = L_var.detach() + delta_l.detach()
+                res = torch.stack([Rn - r_hat.detach(), Cn - c_hat.detach()], dim=-1)
+                dX = torch.linalg.solve(J, res.unsqueeze(-1)).squeeze(-1)
+                P = P + dX[..., 0]
+                L = L + dX[..., 1]
 
-        # De-normalize
-        lat = P * lat_scale + lat_off
-        lon = L * long_scale + long_off
+        lat = P * self.lat_scale.view(*self.lat_scale.shape, *s).to(torch.float64) + self.lat_off.view(*self.lat_off.shape, *s).to(torch.float64)
+        lon = L * self.long_scale.view(*self.long_scale.shape, *s).to(torch.float64) + self.long_off.view(*self.long_off.shape, *s).to(torch.float64)
+        return lat.to(orig_dtype), lon.to(orig_dtype)
 
-        return lat, lon
+    def get_pinhole_approximation(self, u: Tensor, v: Tensor, h: Tensor, image_size: Tuple[int, int] = (256, 256)) -> Tuple[Tensor, Tensor]:
+        """
+        計算 RPC 在給定點的局部針孔相機近似。
+        
+        Args:
+            u, v: 像素座標 (row, col)
+            h: 高度 (MSL)
+            image_size: (height, width) 用於設定主點
+        
+        Returns:
+            K: 3x3 內參矩陣
+            R_c2w: 3x3 旋轉矩陣 (camera-to-world)
+                   相機座標系定義：
+                   - X 軸：指向圖像右方
+                   - Y 軸：指向圖像下方  
+                   - Z 軸：指向場景（從相機看出去的方向）
+        """
+        img_h, img_w = image_size
+        
+        with torch.no_grad():
+            lat, lon = self.inverse(u, v, h)
+        
+        with torch.enable_grad():
+            r_earth = 6378137.0
+            deg_to_rad = 3.1415926535 / 180.0
+            lat_v = lat.detach().clone().requires_grad_(True)
+            lon_v = lon.detach().clone().requires_grad_(True)
+            h_v = h.detach().clone().requires_grad_(True)
+            row, col = self.forward(lat_v, lon_v, h_v)
+            
+            du_dlat = torch.autograd.grad(row.sum(), lat_v, retain_graph=True)[0]
+            du_dlon = torch.autograd.grad(row.sum(), lon_v, retain_graph=True)[0]
+            dv_dlat = torch.autograd.grad(col.sum(), lat_v, retain_graph=True)[0]
+            dv_dlon = torch.autograd.grad(col.sum(), lon_v, retain_graph=True)[0]
+            
+            cos_lat = torch.cos(lat * deg_to_rad)
+            
+        # Jacobian: d(pixel) / d(geo)
+        J = torch.stack([
+            torch.stack([du_dlon, du_dlat], dim=-1),
+            torch.stack([dv_dlon, dv_dlat], dim=-1)
+        ], dim=-2)
+        J_inv = torch.linalg.inv(J + torch.eye(2, device=self.device).unsqueeze(0) * 1e-12)
+        
+        # 計算每移動 1 像素對應世界座標的變化（米）
+        # c_right: 圖像 u 方向對應的世界座標變化
+        dx_du = J_inv[..., 0, 0] * deg_to_rad * r_earth * cos_lat
+        dy_du = J_inv[..., 1, 0] * deg_to_rad * r_earth
+        c_right = torch.stack([dx_du, dy_du, torch.zeros_like(dx_du)], dim=-1)
+        
+        # c_down: 圖像 v 方向對應的世界座標變化
+        dx_dv = J_inv[..., 0, 1] * deg_to_rad * r_earth * cos_lat
+        dy_dv = J_inv[..., 1, 1] * deg_to_rad * r_earth
+        c_down = torch.stack([dx_dv, dy_dv, torch.zeros_like(dx_dv)], dim=-1)
+        
+        # 焦距 = 1 / GSD (Ground Sample Distance)
+        fx = 1.0 / c_right.norm(dim=-1).clamp(min=1e-8)
+        fy = 1.0 / c_down.norm(dim=-1).clamp(min=1e-8)
+        
+        # 建構相機座標系（camera-to-world）
+        # 相機 X 軸：指向右（與 c_right 對齊）
+        cam_x = c_right / c_right.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        
+        # 相機 Z 軸：cross(right, down) 會給出「向上」的向量
+        # 但我們需要相機看「向下」（朝向地面），所以取負號
+        cam_z_up = torch.cross(c_right, c_down, dim=-1)
+        cam_z = -cam_z_up / cam_z_up.norm(dim=-1, keepdim=True).clamp(min=1e-8)  # 翻轉使 Z 朝下
+        
+        # 相機 Y 軸：cross(Z, X) 確保右手座標系
+        cam_y = torch.cross(cam_z, cam_x, dim=-1)
+        cam_y = cam_y / cam_y.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+        # R_c2w: 每一列是相機座標軸在世界座標中的方向
+        R_c2w = torch.stack([cam_x, cam_y, cam_z], dim=-1)
+        
+        # 內參矩陣
+        K = torch.eye(3, device=self.device).repeat(*cam_x.shape[:-1], 1, 1)
+        K[..., 0, 0], K[..., 1, 1] = fx, fy
+        K[..., 0, 2], K[..., 1, 2] = img_w / 2.0, img_h / 2.0
+        
+        return K.to(dtype=torch.float32), R_c2w.to(dtype=torch.float32)
+    def compute_camera_geometry(self, h: int, w: int, lat_ref_global: Tensor = None, lon_ref_global: Tensor = None, distance: float = 100.0, gsd: float = 0.5):
+        """
+        計算虛擬針孔相機的內參和外參
+        
+        Args:
+            h, w: 圖像尺寸（像素）
+            lat_ref_global, lon_ref_global: ENU 座標系原點的經緯度
+            distance: 相機距離 HEIGHT_OFF 參考面的高度（米）
+            gsd: Ground Sample Distance（米/像素），衛星圖像的空間解析度
+        
+        Returns:
+            K: [B, 3, 3] 內參矩陣
+            c2w: [B, 4, 4] camera-to-world 外參矩陣
+        
+        座標系定義：
+            - ENU 世界座標系：X=東, Y=北, Z=上
+            - 相機位於 HEIGHT_OFF + distance 高度
+            - 相機 Z 軸指向地面（向下看）
+        """
+        device = self.device
+        dtype = self.line_off.dtype
+        B = self.line_off.shape[0]
+        
+        u_center = torch.full((B,), w / 2.0, device=device, dtype=dtype)
+        v_center = torch.full((B,), h / 2.0, device=device, dtype=dtype)
+        h_mean = self.height_off  # RPC 參考高度 (MSL)
+        
+        # 從 RPC 計算局部相機方向（現在 Z 軸已正確指向場景）
+        K, R_c2w = self.get_pinhole_approximation(u_center, v_center, h_mean, image_size=(h, w))
+        K = K.clone()
+        
+        # 重新計算焦距以匹配虛擬相機高度和 GSD
+        # focal = distance / gsd 讓 FOV 正好覆蓋 image_size * gsd 米
+        focal = distance / gsd
+        K[..., 0, 0], K[..., 1, 1] = focal, focal
+        K[..., 0, 2], K[..., 1, 2] = w / 2.0, h / 2.0
+        
+        # 計算相機在 ENU 座標系中的位置
+        with torch.no_grad():
+            lat_c, lon_c = self.inverse(u_center, v_center, h_mean)
+        
+        lat_ref, lon_ref = (lat_c, lon_c) if lat_ref_global is None else (lat_ref_global, lon_ref_global)
+        r_earth, rad = 6378137.0, 3.1415926535 / 180.0
+        
+        # ENU 座標（相對於參考點）
+        x_c = (lon_c - lon_ref) * rad * r_earth * torch.cos(lat_ref * rad)  # 東
+        y_c = (lat_c - lat_ref) * rad * r_earth  # 北
+        z_c = h_mean + distance  # 上（相機在參考面上方 distance 米）
+        
+        # 建構 4x4 c2w 矩陣
+        c2w = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
+        
+        # 使用從 RPC 計算得到的真實旋轉矩陣
+        # R_c2w 現在正確表示相機的方向（Z 軸指向地面）
+        c2w[:, :3, :3] = R_c2w
+        c2w[:, :3, 3] = torch.stack([x_c, y_c, z_c], dim=-1)
+        
+        return K.to(dtype=torch.float32), c2w.to(dtype=torch.float32)

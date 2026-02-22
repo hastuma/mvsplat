@@ -63,6 +63,12 @@ def export_ply(
     rotation = rotation @ extrinsics[:3, :3].inverse()
 
     # Apply the rotation to the means (Gaussian positions).
+    # 【關鍵修正】確保 means 和 rotation 都是 float32
+    if means.dtype == torch.float64:
+        means = means.to(torch.float32)
+    if rotation.dtype == torch.float64:
+        rotation = rotation.to(torch.float32)
+
     means = einsum(rotation, means, "i j, ... j -> ... i")
 
     # Apply the rotation to the Gaussian rotations.

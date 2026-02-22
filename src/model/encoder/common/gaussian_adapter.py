@@ -59,21 +59,49 @@ class GaussianAdapter(nn.Module):
         device = extrinsics.device
         scales, rotations, sh = raw_gaussians.split((3, 4, 3 * self.d_sh), dim=-1)
 
-        # Map scale features to valid scale range.
         scale_min = self.cfg.gaussian_scale_min
         scale_max = self.cfg.gaussian_scale_max
+        # RPC 模式：scale 直接代表公尺
         scales = scale_min + (scale_max - scale_min) * scales.sigmoid()
-        h, w = image_shape
-        pixel_size = 1 / torch.tensor((w, h), dtype=torch.float32, device=device)
-        multiplier = self.get_scale_multiplier(intrinsics, pixel_size)
-        scales = scales * depths[..., None] * multiplier[..., None]
 
         # Normalize the quaternion features to yield a valid quaternion.
         rotations = rotations / (rotations.norm(dim=-1, keepdim=True) + eps)
-
-        # Apply sigmoid to get valid colors.
         sh = rearrange(sh, "... (xyz d_sh) -> ... xyz d_sh", xyz=3)
+        
+        # SH 處理：
+        # 3DGS 的顏色公式: color = 0.5 + C0 * sh_dc, 其中 C0 ≈ 0.28
+        # 若要讓 color 覆蓋 [0, 1]，sh_dc 需要在 [-1.77, 1.77] 範圍
+        # 
+        # 方案: 直接縮放 DC component (不使用 tanh，讓 gradient 更順暢)
+        # 網路初始輸出接近 0，乘以 3.0 讓梯度更大，學習更快
+        sh_dc = sh[..., :1]  # DC component [B, N, 3, 1]
+        sh_higher = sh[..., 1:]  # Higher order [B, N, 3, d_sh-1]
+        
+        # DC: 使用 tanh 縮放到 [-0.5, 0.5]，再加 0.5 移到 [0, 1]
+        # 這比 sigmoid 有更好的梯度特性：
+        #   - sigmoid 在輸入遠離 0 時梯度很小
+        #   - tanh 在 [-2, 2] 範圍都有不錯的梯度
+        # 同時添加 bias=0.5 確保初始渲染是灰色
+        sh_dc_scaled = torch.tanh(sh_dc) * 0.5 + 0.5  # 輸出 [0, 1]
+        
+        # Higher order: 保持較小的值（視角相關效果通常較弱）
+        sh = torch.cat([sh_dc_scaled, sh_higher], dim=-1)
         sh = sh.broadcast_to((*opacities.shape, 3, self.d_sh)) * self.sh_mask
+        
+
+        # Force all Gaussians to have scale = 0.1 meters
+        # scales = torch.full_like(scales, 0.07)  # All axes = 0.1 meter
+
+        # 讓球全部都白色:
+        # For SH degree 0 (DC component), white = 0.28209 (1/(2*sqrt(pi)))
+        # All higher-degree coefficients = 0
+        # sh_shape = (*opacities.shape, 3, self.d_sh)
+        # sh = torch.zeros(sh_shape, dtype=sh.dtype, device=sh.device)
+        # # Set DC component (index 0) for RGB channels to white
+        # sh[..., :, 0] = 0.28209  # This makes the color white when rendered
+
+
+
 
         # Create world-space covariance matrices.
         covariances = build_covariance(scales, rotations)

@@ -38,94 +38,21 @@ class EncoderVisualizerCostVolume(
         context: BatchedViews,
         global_step: int,
     ) -> dict[str, Float[Tensor, "3 _ _"]]:
-        # Short-circuit execution when using mvsplat.
-        return {}
-
         visualization_dump = {}
 
-        softmax_weights = []
-
-        def hook(module, input, output):
-            softmax_weights.append(output)
-
-        # Register hooks to grab attention.
-        handles = [
-            layer[0].fn.attend.register_forward_hook(hook)
-            for layer in self.encoder.epipolar_transformer.transformer.layers
-        ]
-
-        result = self.encoder.forward(
+        self.encoder.forward(
             context,
             global_step,
             visualization_dump=visualization_dump,
             deterministic=True,
         )
 
-        # De-register hooks.
-        for handle in handles:
-            handle.remove()
-
-        softmax_weights = torch.stack(softmax_weights)
-
-        # Generate high-resolution context images that can be drawn on.
-        context_images = context["image"]
-        _, _, _, h, w = context_images.shape
-        length = min(h, w)
-        min_resolution = self.cfg.min_resolution
-        scale_multiplier = (min_resolution + length - 1) // length
-        if scale_multiplier > 1:
-            context_images = repeat(
-                context_images,
-                "b v c h w -> b v c (h rh) (w rw)",
-                rh=scale_multiplier,
-                rw=scale_multiplier,
-            )
-
-        # This is kind of hacky for now, since we're using it for short experiments.
-        if self.cfg.export_ply:
-            if wandb.run is not None:
-                name = wandb.run._name.split(" ")[0]
-            else:
-                name = "local"
-            ply_path = Path(f"outputs/gaussians/{name}/{global_step:0>6}.ply")
-            export_ply(
-                context["extrinsics"][0, 0],
-                result.means[0],
-                visualization_dump["scales"][0],
-                visualization_dump["rotations"][0],
-                result.harmonics[0],
-                result.opacities[0],
-                ply_path,
-            )
-
+        # Return ONLY the concatenated image the user requested
         return {
-            "attention": self.visualize_attention(
-                context_images,
-                visualization_dump["sampling"],
-                softmax_weights,
-            ),
-            "epipolar_samples": self.visualize_epipolar_samples(
-                context_images,
-                visualization_dump["sampling"],
-            ),
-            "epipolar_color_samples": self.visualize_epipolar_color_samples(
-                context_images,
-                context,
-            ),
-            "gaussians": self.visualize_gaussians(
-                context["image"],
-                result.opacities,
-                result.covariances,
-                result.harmonics[..., 0],  # Just visualize DC component.
-            ),
-            "overlaps": self.visualize_overlaps(
-                context["image"],
-                visualization_dump["sampling"],
-                visualization_dump.get("is_monocular", None),
-            ),
-            "depth": self.visualize_depth(
+            "depth_comparison": self.visualize_depth(
                 context,
                 visualization_dump["depth"],
+                visualization_dump.get("features", None),
             ),
         }
 
@@ -203,33 +130,54 @@ class EncoderVisualizerCostVolume(
         vis = add_border(hcat(add_label(ray_view, "ray_view"), vis, align="top"))
         return vis
 
+    # def visualize_depth(
+    #     self,
+    #     context: BatchedViews,
+    #     multi_depth: Float[Tensor, "batch view height width surface spp"],
     def visualize_depth(
         self,
         context: BatchedViews,
         multi_depth: Float[Tensor, "batch view height width surface spp"],
+        features: Optional[Float[Tensor, "batch view channel feat_height feat_width"]] = None,
     ) -> Float[Tensor, "3 vis_width vis_height"]:
-        multi_vis = []
-        *_, srf, _ = multi_depth.shape
-        for i in range(srf):
-            depth = multi_depth[..., i, :]
-            depth = depth.mean(dim=-1)
+        # Use simple visualization for only the first sample in batch/view
+        b_idx, v_idx = 0, 0
+        
+        # 1. Input RGB [3, H, W]
+        rgb = context["image"][b_idx, v_idx].clone()
+        # Min-Max Normalization for RGB to ensure it's visible (0-1 range)
+        r_min, r_max = rgb.min(), rgb.max()
+        rgb = (rgb - r_min) / (r_max - r_min + 1e-6)
+        h, w = rgb.shape[-2:]
 
-            # Compute relative depth and disparity.
-            near = rearrange(context["near"], "b v -> b v () ()")
-            far = rearrange(context["far"], "b v -> b v () ()")
-            relative_depth = (depth - near) / (far - near)
-            relative_disparity = 1 - (1 / depth - 1 / far) / (1 / near - 1 / far)
+        # 2. Feature Map (Color - First 3 Channels) [3, H, W]
+        if features is not None:
+            # Use color for features to distinguish from grayscale height map
+            feat = features[b_idx, v_idx, :3].clone() # [3, Hf, Wf]
+            # Resize feature map to match RGB resolution
+            feat = torch.nn.functional.interpolate(
+                feat.unsqueeze(0), size=(h, w), mode="bilinear", align_corners=False
+            ).squeeze(0)
+            # Min-Max Normalization
+            f_min, f_max = feat.min(), feat.max()
+            feat = (feat - f_min) / (f_max - f_min + 1e-6)
+        else:
+            feat = torch.zeros_like(rgb)
 
-            relative_depth = apply_color_map_to_image(relative_depth, "turbo")
-            relative_depth = vcat(*[hcat(*x) for x in relative_depth])
-            relative_depth = add_label(relative_depth, "Depth")
-            relative_disparity = apply_color_map_to_image(relative_disparity, "turbo")
-            relative_disparity = vcat(*[hcat(*x) for x in relative_disparity])
-            relative_disparity = add_label(relative_disparity, "Disparity")
-            multi_vis.append(add_border(hcat(relative_depth, relative_disparity)))
+        # 3. Predicted Height Map (Grayscale) [3, H, W]
+        # Average across surfaces and spp
+        depth = multi_depth[b_idx, v_idx].mean(dim=(-2, -1))
+        # Min-Max Normalization (Matches debug.py logic)
+        d_min, d_max = depth.min(), depth.max()
+        depth_norm = (depth - d_min) / (d_max - d_min + 1e-6)
+        # Convert to 3-channel grayscale for concatenation
+        height_map_bw = repeat(depth_norm, "h w -> 3 h w")
 
-        return add_border(vcat(*multi_vis))
+        # 4. Concatenate horizontally: RGB | Feature | Height
+        combined = torch.cat([rgb, feat, height_map_bw], dim=-1)
 
+        return combined
+    
     def visualize_overlaps(
         self,
         context_images: Float[Tensor, "batch view 3 height width"],
