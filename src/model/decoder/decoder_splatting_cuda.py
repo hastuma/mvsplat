@@ -42,6 +42,15 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         image_shape: tuple[int, int],
         depth_mode: DepthRenderingMode | None = None,
     ) -> DecoderOutput:
+        # mod_val = 0.25
+        # intrinsics[..., 0, 0] = mod_val
+        # intrinsics[..., 1, 1] = mod_val
+        # intrinsics[..., 0, 2] = mod_val
+        # intrinsics[..., 1, 2] = mod_val
+        print(f"extrinsics : {extrinsics} \n intrinsics : {intrinsics} \n")
+        print(f"\n[DecoderSplattingCUDA] Forward pass with image shape {image_shape} and depth mode {depth_mode}")
+        print(f"near , far : {near}, {far}")
+        gteowht= input("in the decoder forward, press Enter to continue...")  # 暂停以检查输入参数
         b, v, _, _ = extrinsics.shape
         color = render_cuda(
             rearrange(extrinsics, "b v i j -> (b v) i j"),

@@ -92,6 +92,7 @@ def warp_with_rpc(
     # 檢驗 Height
     print(f"3. Depth/Height Plane (First 3): {depth[0, :3, 0, 0].flatten().cpu().numpy()}")
     print(f"3. Depth/Height Plane (last 3): {depth[0, -3:, 0, 0].flatten().cpu().numpy()}")
+    # exit()
     # print(f"x_grid sample: {x_grid[0, :5]} | y_grid sample: {y_grid[:5, 0]}")
     # print(f"u_ref sample: {u_ref[0, 0, :5, 0]} | v_ref sample: {v_ref[0, 0, :5, 0]}")
     
@@ -222,19 +223,15 @@ def prepare_feat_proj_data_lists(
     # [LOG] Track depth-to-height mapping for RPC mode
     if rpcs is not None:
         h_off = rpcs[:, :, 8] 
-        cam_msl = h_off + 100.0 # 虛擬相機高度
-        
-        # 這裡的 near/far 是距離 (Distance)
-        # Altitude = Cam_MSL - Distance
-        h_near_plane = cam_msl - near # 最高的平面
-        h_far_plane = cam_msl - far   # 最低的平面
+        # near = H - scene_range → H = near + scene_range (scene_range=20 hardcoded in encoder)
+        # 或直接用 near+far 中點估計，這裡僅供 debug print
+        h_near_plane = h_off + 20 # 最高的平面
+        h_far_plane = h_off - 20   # 最低的平面
         
         print(f"\n[GEOMETRY LOG] prepare_feat_proj_data_lists")
         print(f"  > Ground Level (approx): {h_off[0,0].item():.1f}m MSL")
-        print(f"  > Camera Level: {cam_msl[0,0].item():.1f}m MSL")
         print(f"  > Search Range (Dist): {near.min().item():.1f}m to {far.max().item():.1f}m")
-        print(f"  > Search Planes (Alt): {h_near_plane.mean().item():.1f}m (Top) down to {h_far_plane.mean().item():.1f}m (Bottom)")
-        print(f"  > Check: Ground ({-19.0}) inside [{h_near_plane.mean().item():.1f}, {h_far_plane.mean().item():.1f}]? {'YES' if (h_far_plane.mean() < -19 < h_near_plane.mean()) else 'NO -- ERROR!'}")
+        print(f"  > Altitude Range (approx): top={h_near_plane.mean().item():.1f}m, bottom={h_far_plane.mean().item():.1f}m")
 
     depth_candi_curr = repeat(depth_candi_curr, "vb d -> vb d () ()")
     return feat_lists, intr_curr, pose_curr_lists, depth_candi_curr, rpc_curr_lists
@@ -400,7 +397,7 @@ class DepthPredictorMultiView(nn.Module):
         b, v, c, h, w = features.shape
         if visualization_dump is not None:
              visualization_dump["features"] = features
-        
+        # ejgroegore = input(f"distance near far {distance_near}, {distance_far}")
         feat_comb_lists, intr_curr, pose_curr_lists, disp_candi_curr, rpc_curr_lists = (
             prepare_feat_proj_data_lists(
                 features,
@@ -447,20 +444,33 @@ class DepthPredictorMultiView(nn.Module):
             
             all_warped_features = [feat_ref_expanded]
             
+            # 準備 per-(vB) 相機推導高度，供各 view pair 的 altitude 轉換使用
+            # virtual_cam_dist_vb: [v*B]，順序與 (v b) 排列一致
+            virtual_cam_dist_raw = extra_info.get("virtual_camera_distance", None) if extra_info else None
+            if virtual_cam_dist_raw is not None:
+                # virtual_cam_dist_raw: [B, V] -> rearrange to [v*B]
+                virtual_cam_dist_vb = rearrange(virtual_cam_dist_raw, "b v -> (v b)")  # [v*B]
+            else:
+                virtual_cam_dist_vb = None
+            
             for feat10, rpc_pair in zip(feat_comb_lists[1:], rpc_curr_lists):
                 ref_rpc_data, src_rpc_data = rpc_pair
-                # Index 1: LINE_SCALE, Index 3: SAMP_SCALE (based on our 90-coeff layout)
-                # Note: We assumed layout in geographic_cropping.py
-                # 0: LINE_OFF, 1: LINE_SCALE, 2: SAMP_OFF, 3: SAMP_SCALE
                 print(f"\n[WARP DEBUG] Processing View Pair:")
                 print(f"  > Ref View LINE_SCALE: {ref_rpc_data[0, 1].item():.1f}")
                 print(f"  > Src View LINE_SCALE: {src_rpc_data[0, 1].item():.1f}")
-                # gre=input("continue?")
-                h_off = ref_rpc_data[:, 8:9].unsqueeze(-1).unsqueeze(-1) # [vB, 1, 1, 1]
-                cam_msl = h_off + 100.0
-                
+                h_off = ref_rpc_data[:, 8:9].unsqueeze(-1).unsqueeze(-1)  # [vB, 1, 1, 1]
+                # 使用 RPC Jacobian 推導的虛擬相機高度（非 hardcode 100m）
+                if virtual_cam_dist_vb is not None:
+                    # ref_rpc_data 的 batch 維度大小 == v*B
+                    vb_size = ref_rpc_data.shape[0]
+                    H_derived = virtual_cam_dist_vb[:vb_size].reshape(-1, 1, 1, 1).to(h_off.device)
+                else:
+                    H_derived = torch.full_like(h_off, 44.8)  # fallback ≈ 128×0.35m
+                cam_msl = h_off + H_derived
+                print(f"  > cam_msl (center): {cam_msl[0,0,0,0].item():.2f}m  (H_derived={H_derived[0,0,0,0].item():.2f}m)")
+
                 # Convert distance -> altitude for warping
-                height_candi = cam_msl - disp_candi_curr # [vB, D, 1, 1]
+                height_candi = cam_msl - disp_candi_curr  # [vB, D, 1, 1]
                 
                 feat_src_warped = warp_with_rpc(
                     feat10,
@@ -493,7 +503,11 @@ class DepthPredictorMultiView(nn.Module):
             if rpc_curr_lists and len(rpc_curr_lists) > 0:
                 ref_rpc_debug = rpc_curr_lists[0][0] 
                 h_off_debug = ref_rpc_debug[0, 8].item()
-                cam_msl_debug = h_off_debug + 100.0
+                # 使用 extra_info 中的推導高度（若可用），否則 fallback
+                if virtual_cam_dist_vb is not None:
+                    cam_msl_debug = h_off_debug + virtual_cam_dist_vb[0].item()
+                else:
+                    cam_msl_debug = h_off_debug + 44.8  # fallback
                 # 取得對應距離
                 dists_debug = disp_candi_curr[0].detach().cpu()
                 best_dist = dists_debug[center_idx].item()
@@ -542,15 +556,15 @@ class DepthPredictorMultiView(nn.Module):
                 # exit()
 
             # 把cost volume 跟 Ref feature 結合，讓 U-Net 可以同時看到兩者資訊
-            print("raw_correlation_in shape[before concat]:", raw_correlation_in.shape)
-            print("feat01 shape:", feat01.shape)
+            # print("raw_correlation_in shape[before concat]:", raw_correlation_in.shape)
+            # print("feat01 shape:", feat01.shape)
             raw_correlation_in = torch.cat((raw_correlation_in, feat01), dim=1)
 
         # refine cost volume via 2D u-net
         raw_correlation = self.corr_refine_net(raw_correlation_in)  # (vb d h w)
         # apply skip connection
-        print("raw_correlation_in shape:", raw_correlation_in.shape)
-        print("raw_correlation shape:", raw_correlation.shape)
+        # print("raw_correlation_in shape:", raw_correlation_in.shape)
+        # print("raw_correlation shape:", raw_correlation.shape)
         # exit()
         raw_correlation += self.regressor_residual(raw_correlation_in)
 
@@ -609,18 +623,6 @@ class DepthPredictorMultiView(nn.Module):
                 h=h*self.upscale_factor, 
                 w=w*self.upscale_factor
             )
-
-        # === [INFO] 印出 3D Gaussians 數量 ===
-        num_gaussians = raw_gaussians.shape[0] * raw_gaussians.shape[1] * raw_gaussians.shape[2]
-        print(f"\n{'='*60}")
-        print(f"[3D GAUSSIANS INFO - After Cost Volume]")
-        print(f"  Shape: raw_gaussians = {raw_gaussians.shape}")
-        print(f"  Shape: densities = {densities.shape}")
-        print(f"  Shape: depths = {depths.shape}")
-        print(f"  Total 3D Gaussians = {num_gaussians:,}")
-        print(f"  (Batch={raw_gaussians.shape[0]}, Views={raw_gaussians.shape[1]}, Pixels={raw_gaussians.shape[2]})")
-        print(f"{'='*60}\n")
-        # gjeoehjioteh = input()
         return EncoderOutput(
             raw_gaussians,
             densities,

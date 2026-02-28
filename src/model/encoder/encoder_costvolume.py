@@ -27,10 +27,6 @@ from ...global_cfg import get_cfg
 from .epipolar.epipolar_sampler import EpipolarSampler
 from ..encodings.positional_encoding import PositionalEncoding
 
-# 3. Depth/Height Plane (First 3): [-159.5  -192.53225708 -225.56451416]
-# 3. Depth/Height Plane (last 3): [-1117.43548584 -1150.46777344 -1183.5       ]
-
-
 @dataclass
 class OpacityMappingCfg:
     initial: float
@@ -187,7 +183,6 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
         # We must calculate the virtual pinhole cameras BEFORE the depth_predictor
         # so that the cost volume matching uses physically correct intrinsics/poses.
         if "rpc" in context:
-            from ...geometry.rpc import RPC
             rpc_flat = RPC(rearrange(context["rpc"], "b v c -> (b v) c"))
             
             # 計算第一視角圖像中心的真實經緯度作為 ENU 參考點
@@ -203,17 +198,17 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             context["_lat_ref"] = lat_ref_b
             context["_lon_ref"] = lon_ref_b
             
-            # 從 RPC Jacobian 推算 GSD，再由目標半視角決定 distance（不再使用固定值）。
-            # compute_camera_geometry 回傳 (K, c2w, distance)，其中
-            # distance: [B*V] 每個虛擬相機相對 HEIGHT_OFF 的高度（米）。
+            # 從 RPC Jacobian 近似出虛擬相機幾何（完全 Data-driven，由 height_scale × GSD_rpc 自動推導）
             K_approx, c2w, distance_flat = rpc_flat.compute_camera_geometry(h, w, lat_ref_b, lon_ref_b)
-            
+            # distance_flat: [B*V]，reshape 為 [B, V] 供後續 per-view 使用
+            distance_bv = rearrange(distance_flat, "(b v) -> b v", b=b, v=v)
+            w2c = torch.linalg.inv(c2w)
             # Update Context: Now depth_predictor will see these correct cameras!
             context["extrinsics"] = rearrange(c2w, "(b v) i j -> b v i j", b=b, v=v)
             context["intrinsics"] = rearrange(K_approx, "(b v) i j -> b v i j", b=b, v=v)
             
-            # 存儲 per-view distance [B, V] 供後續 near/far 和 altitude 計算使用
-            context["_virtual_camera_distance"] = rearrange(distance_flat, "(b v) -> b v", b=b, v=v)
+            # 存儲 per-view distance [B, V] 供後續使用
+            context["_virtual_camera_distance"] = distance_bv
 
         # ============================================================
         # 動態計算 near/far（相機座標系的深度範圍）
@@ -225,10 +220,12 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             scene_z_min = h_off - scene_range  # 最低海拔 (MSL)
             scene_z_max = h_off + scene_range  # 最高海拔 (MSL)
             
-            # 3. 相機高度決定
-            # 相機設置於中心點高度 + 100 公尺處
-            distance = context.get("_virtual_camera_distance", 100.0)
-            camera_z = h_off + distance
+            # 3. 相機高度決定（使用 RPC 推導的 per-view distance [B, V]）
+            distance_bv = context.get("_virtual_camera_distance", None)
+            if distance_bv is None:
+                # fallback: 若無 RPC，使用 h_off 形狀的預設值
+                distance_bv = torch.full_like(h_off, 44.8)
+            camera_z = h_off + distance_bv
             
             # 4. Near/Far 定義 (這是"距離" Distance, 而非絕對海拔)
             # near = 相機到最高海拔平面的垂直距離
@@ -239,6 +236,8 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             # if global_step % 50 == 0:
             print(f"\n[GEOMETRY CONFIG] Encoder")
             print(f"  HEIGHT_OFF: {h_off[0,0].item():.1f}m")
+            print(f"  Derived H (from RPC GSD×w/2): {distance_bv[0,0].item():.2f}m  "
+                  f"focal≈{(distance_bv[0,0]/0.35).item():.1f}px")
             print(f"  Search Range (MSL Alt): [{scene_z_min[0,0].item():.1f}, {scene_z_max[0,0].item():.1f}]")
             print(f"  Camera Altitude (MSL): {camera_z[0,0].item():.1f}")
             print(f"  Distance near/far (to Cam): [{distance_near[0,0].item():.1f}, {distance_far[0,0].item():.1f}]")
@@ -249,6 +248,9 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
         extra_info["rpcs"] = context["rpc"]
         extra_info['images'] = rearrange(context["image"], "b v c h w -> (v b) c h w")
         extra_info["scene_names"] = scene_names
+        # 傳遞 per-view 推導相機高度 [B, V]，讓 depth_predictor 做正確的 altitude 轉換
+        if "_virtual_camera_distance" in context:
+            extra_info["virtual_camera_distance"] = context["_virtual_camera_distance"]
 
         encoder_output = self.depth_predictor(
             in_feats,
@@ -285,7 +287,7 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
         if "rpc" in context:
             # RPC branch: Compute ENU means using the already updated cameras
             b, v, r, srf, _ = depths.shape
-            # distance_bv: [B, V] per-view 虛擬相機高度（由 RPC GSD 推算）
+            # distance_bv: [B, V]，每個視角各自的虛擬相機高度（由 RPC Jacobian 推導）
             distance_bv = context["_virtual_camera_distance"]  # [B, V]
             
             u_all = rearrange(xy_ray[..., 1] * h, "b v r srf -> (b v r srf)")
@@ -294,11 +296,10 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             # Match Distance-First scheme: depths are distances from camera.
             dist_all = rearrange(depths, "b v r srf () -> (b v r srf)")
             h_off_all_v = rearrange(repeat(context["rpc"][:, :, 8], "b v -> b v r srf", r=r, srf=srf), "b v r srf -> (b v r srf)")
-            
-            # 將 per-view distance 擴展為和 dist_all 相同的形狀 [B*V*R*SRF]
+            # 展開 per-view distance 到 [B*V*R*SRF]
             distance_all = rearrange(repeat(distance_bv, "b v -> b v r srf", r=r, srf=srf), "b v r srf -> (b v r srf)")
             
-            # Altitude = Cam_Altitude - NetworkOutputDistance
+            # Altitude = Cam_Altitude - Distance
             h_all = (h_off_all_v + distance_all) - dist_all
             
             # ============================================================
@@ -363,6 +364,7 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             # ============================================================
             # [DEBUG] 驗證 3 個視角 RPC Inverse 結果是否重疊
             # ============================================================
+            """
             with torch.no_grad():
                 lat_per_view = rearrange(lat_a, "(b v r srf) -> b v (r srf)", b=b, v=v, r=r, srf=srf)
                 lon_per_view = rearrange(lon_a, "(b v r srf) -> b v (r srf)", b=b, v=v, r=r, srf=srf)
@@ -419,7 +421,7 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
                             print(f"    ❌ 幾乎不重疊！(偏移 {shift:.2f}m >> 範圍 {avg_ext:.2f}m)")
                 
                 print(f"\n{'='*70}\n")
-                # ehoprwtjoptw = input()
+                # ehoprwtjoptw = input()"""
             # ENU Origin: 使用先前計算並存儲的圖像中心經緯度
             lat_ref_b = context["_lat_ref"]  # [B]
             lon_ref_b = context["_lon_ref"]  # [B]
@@ -476,7 +478,7 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
                 
                 # 中間 25% 面積意味著 X, Y 各取中間 50% (0.5 * 0.5 = 0.25)
                 # 也就是兩邊各留 25% 的邊際
-                margin = 0.25 
+                margin = 0.1
                 is_center = (
                     (x_coords > x_min + x_range * margin) & 
                     (x_coords < x_max - x_range * margin) &
@@ -512,15 +514,6 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
                     print(f"   X Center Range: [{x_min + x_range*margin:.2f}, {x_max - x_range*margin:.2f}]")
                     print(f"   Y Center Range: [{y_min + y_range*margin:.2f}, {y_max - y_range*margin:.2f}]")
             
-            # [GRADIENT CHECK] 確認所有 Gaussian 參數的 requires_grad 狀態
-            if global_step % 3 == 0:
-                print(f"\n[GRADIENT CHECK - Step {global_step}]")
-                print(f"  gaussians.means.requires_grad = {gaussians.means.requires_grad}")
-                print(f"  gaussians.scales.requires_grad = {gaussians.scales.requires_grad}")
-                print(f"  gaussians.opacities.requires_grad = {gaussians.opacities.requires_grad}")
-                print(f"  gaussians.harmonics.requires_grad = {gaussians.harmonics.requires_grad}")
-                print(f"  gaussians.covariances.requires_grad = {gaussians.covariances.requires_grad}")
-                print(f"  gaussians.rotations.requires_grad = {gaussians.rotations.requires_grad}")
             
         else:
             # Original Pinhole branch (Unchanged)

@@ -14,6 +14,7 @@ from torch import Tensor, nn, optim
 import numpy as np
 import json
 
+from ..geometry.rpc import RPC
 from ..dataset.data_module import get_data_shim
 from ..dataset.types import BatchedExample
 from ..dataset import DatasetCfg
@@ -145,29 +146,37 @@ class ModelWrapper(LightningModule):
             
             rpc_target_flat = RPC(rearrange(batch["target"]["rpc"], "b v c -> (b v) c"))
             
-            # The RPCs in this dataset are already adjusted for the 256x256 crops.
-            # compute_camera_geometry 現在由 RPC Jacobian 推算 GSD 和 distance，
-            # 回傳三元組 (K, c2w, distance)，其中 distance: [B*V_tgt]。
+            # 從 RPC Jacobian 推導虛擬相機幾何（完全 Data-driven，無 hardcoded 參數）
             K_tgt, c2w_tgt, distance_tgt_flat = rpc_target_flat.compute_camera_geometry(h, w, lat_ref_flat, lon_ref_flat)
-            
+
+            # --- Hardcoded camera parameters for debugging ---
+            K_tgt = torch.tensor([[
+                [1187255.75952377,   0.0,                113722.91093382722],
+                [0.0,                1178055.401262924,  -194568.0592035301],
+                # [1187255.75952377, 0.0,              112954.91093382722], // 算過的，第0,3 個
+                # [0.0,              1178055.401262924, -194568.0592035301],
+                [0.0,              0.0,               1.0              ],
+            ]], dtype=K_tgt.dtype, device=K_tgt.device)
+            c2w_tgt = torch.linalg.inv(torch.tensor([[
+                [0.8867532204124197,  -0.009486012188437915,  0.4621458013018875,  -37477.919892478676],
+                [0.10741489563426863, -0.9681921197734719,   -0.22597800646175822,  65542.12029332563 ],
+                [0.4495895531304993,   0.25002806798700034,  -0.8575285411778468,   394736.3683483885 ],
+                [0.0,                  0.0,                   0.0,                  1.0               ],
+            ]], dtype=c2w_tgt.dtype, device=c2w_tgt.device))
             # Since RPC and Image are both (h, w), no further scaling of K is needed for projection.
             # Just ensure the batch is updated with these consistent matrices.
             batch["target"]["extrinsics"] = rearrange(c2w_tgt, "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
             batch["target"]["intrinsics"] = rearrange(K_tgt, "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
-            # 儲存 per-view distance [B, V_tgt] 供後續 near/far 使用
-            batch["target"]["_virtual_camera_distance"] = rearrange(distance_tgt_flat, "(b v) -> b v", b=b_tgt, v=v_tgt)
-            print(type(batch["context"]))
-            # print(batch["context"])
-            print(batch["context"]["image"].shape)
-        # greger = input("Press Enter to continue...")
-        gaussians, vis_dump = self.encoder(
-            batch["context"], self.global_step, False, scene_names=batch["scene"]
-        )
+            
+            # 保存 distance 供後續計算 near/far 使用（避免重複呼叫 compute_camera_geometry）
+            distance_tgt = rearrange(distance_tgt_flat, "(b v) -> b v", b=b_tgt, v=v_tgt)
+            
+        gaussians, vis_dump = self.encoder(batch["context"], self.global_step, False, scene_names=batch["scene"])
         
         # ============================================================
         # [RENDER DEBUG] 詳細輸出相機和 Gaussian 參數
         # ============================================================
-        if self.global_step % 10 == 0:
+        if False:
             print("\n" + "=" * 70)
             print("🎥 [RENDER DEBUG] 渲染參數詳細分析")
             print("=" * 70)
@@ -250,51 +259,47 @@ class ModelWrapper(LightningModule):
             print(f"   ❌ 在相機後面的 Gaussians: {behind_camera.sum().item()}/{len(gs_depths)} ({behind_camera.sum().item()/len(gs_depths)*100:.1f}%)")
             
             print("=" * 70 + "\n")
-        
+            # exit()
         # ============================================================
         # [CRITICAL FIX] 動態計算渲染器需要的 near/far
-        # 使用 RPC 參數計算相機和場景之間的實際距離
+        # 使用上方已計算的 distance_tgt（來自 Block 1 的 compute_camera_geometry）
         # ============================================================
-        if "rpc" in batch["context"]:
-            # 從 RPC 參數取得場景高度範圍
-            h_off = batch["context"]["rpc"][:, 0, 8]    # HEIGHT_OFF [B]
-            h_scale = batch["context"]["rpc"][:, 0, 9]  # HEIGHT_SCALE [B]
+        if "rpc" in batch["context"] and "rpc" in batch["target"]:
+            # 直接使用 Block 1 已計算的 distance_tgt，無需重複呼叫 compute_camera_geometry
+            h_off_tgt = batch["target"]["rpc"][:, :, 8]    # HEIGHT_OFF [B, V_target]
+            scene_range = 20.0  # ±20m 場景範圍（與 encoder_costvolume 一致）
+            scene_z_min = h_off_tgt - scene_range
+            scene_z_max = h_off_tgt + scene_range
             
-            # 使用由 RPC GSD 推算的 per-view distance（若已儲存），否則回退到保守預設值
-            b_tgt, v_tgt = batch["target"]["extrinsics"].shape[:2]
-            if "_virtual_camera_distance" in batch["target"]:
-                # [B, V_tgt] — 每個 target 視角各自的虛擬相機高度
-                distance_tgt = batch["target"]["_virtual_camera_distance"]  # [B, V_tgt]
-            else:
-                distance_tgt = torch.full((b_tgt, v_tgt), 100.0,
-                                          device=h_off.device, dtype=h_off.dtype)
+            # 相機高度（MSL 絕對高度）
+            camera_z_tgt = h_off_tgt + distance_tgt
             
-            # 場景高度範圍（MSL 絕對高度），擴展至 [B, V_tgt]
-            scene_z_min = (h_off - h_scale).unsqueeze(1).expand(b_tgt, v_tgt)  # 最低高度
-            scene_z_max = (h_off + h_scale).unsqueeze(1).expand(b_tgt, v_tgt)  # 最高高度
+            # Near/Far 定義（相機到場景的距離）
+            render_near = (camera_z_tgt - scene_z_max).clamp(min=1.0)
+            render_far = (camera_z_tgt - scene_z_min).clamp(min=render_near + 1.0)
             
-            # 相機高度（MSL 絕對高度）：[B, V_tgt]
-            camera_z = h_off.unsqueeze(1) + distance_tgt  # [B, V_tgt]
-            
-            # 相機座標系的 near/far（相機到場景的距離）
-            margin = 10.0  # 額外邊界避免裁剪
-            render_near = (camera_z - scene_z_max - margin).clamp(min=1.0)
-            render_far = (camera_z - scene_z_min + margin).clamp(min=render_near + 1.0)
-            
-            if self.global_step % 50 == 0:
-                print(f"\n🔧 [RENDER NEAR/FAR] model_wrapper")
-                print(f"   HEIGHT_OFF: {h_off[0].item():.1f}, HEIGHT_SCALE: {h_scale[0].item():.1f}")
-                print(f"   Scene Z (MSL): [{scene_z_min[0,0].item():.1f}, {scene_z_max[0,0].item():.1f}]")
-                print(f"   Camera Z (MSL): {camera_z[0,0].item():.1f} (distance={distance_tgt[0,0].item():.1f}m)")
-                print(f"   ✅ Render near/far: [{render_near[0,0].item():.1f}, {render_far[0,0].item():.1f}]")
         else:
             render_near = batch["target"]["near"]
             render_far = batch["target"]["far"]
         
+        render_near = torch.full_like(render_near, 1.0, dtype=torch.float32)
+        render_far = torch.full_like(render_far, 10000.0, dtype=torch.float32)
+        # 手動建立一個 3x3 內參矩陣
+        # 手動建立一個 3x3 內參矩陣
+        # device = batch["target"]["intrinsics"].device
+        # dtype = batch["target"]["intrinsics"].dtype
+        # new_K = torch.tensor([
+        #     [12, 0.0,        128.0],
+        #     [0.0,        12, 128.0],
+        #     [0.0,        0.0,        1.0  ]
+        # ], device=device, dtype=dtype)
+        # new_K_batched = new_K.unsqueeze(0).unsqueeze(0).expand(1, 3, 3, 3)
+        # print(f"render_near , render_far  before decoder forward : {render_near}, {render_far}")
         output = self.decoder.forward(
             gaussians,
             batch["target"]["extrinsics"],
             batch["target"]["intrinsics"],
+            # new_K,
             render_near,
             render_far,
             (h, w),
@@ -394,7 +399,6 @@ class ModelWrapper(LightningModule):
             print(
                 f"train step {self.global_step}; "
                 f"scene = {[x[:20] for x in batch['scene']]}; "
-                f"far = {batch['context']['far'].detach().cpu().numpy().mean():.2f}; "
                 f"loss = {total_loss:.6f}"
             )
             
@@ -473,7 +477,7 @@ class ModelWrapper(LightningModule):
         # Tell the data loader processes about the current step.
         if self.step_tracker is not None:
             self.step_tracker.set_step(self.global_step)
-
+        # exit()
         return total_loss
 
     def test_step(self, batch, batch_idx):
@@ -498,17 +502,11 @@ class ModelWrapper(LightningModule):
             lon_ref_flat = lon_ref_origin.repeat_interleave(v_tgt)
             
             rpc_target_flat = RPC(rearrange(batch["target"]["rpc"], "b v c -> (b v) c"))
-            h_orig, w_orig = 1024, 1024
-            distance = 100.0  # 相機高度 100 米
-            K_tgt, c2w_tgt = rpc_target_flat.compute_camera_geometry(h_orig, w_orig, lat_ref_flat, lon_ref_flat, distance=distance)
-            
-            # Scale Intrinsics
-            scale_model = h / h_orig
-            K_tgt_model = K_tgt.clone()
-            K_tgt_model[:, :2, :] *= scale_model
+            # 直接使用實際影像尺寸 (h, w)，完全由 RPC 數據驅動（height_scale × GSD_rpc）
+            K_tgt, c2w_tgt, _ = rpc_target_flat.compute_camera_geometry(h, w, lat_ref_flat, lon_ref_flat)
             
             batch["target"]["extrinsics"] = rearrange(c2w_tgt, "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
-            batch["target"]["intrinsics"] = rearrange(K_tgt_model, "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
+            batch["target"]["intrinsics"] = rearrange(K_tgt, "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
 
         # Render Gaussians.
         with self.benchmarker.time("encoder"):
