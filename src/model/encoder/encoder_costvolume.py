@@ -187,8 +187,8 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             
             # 計算第一視角圖像中心的真實經緯度作為 ENU 參考點
             # 這比使用 RPC 的 LAT_OFF/LONG_OFF 更準確，因為那只是 RPC 正規化參數
-            rpc_first = RPC(context["rpc"][:, 0, :])  # [B, 90]
-            h_center_ref = context["rpc"][:, 0, 8]   # HEIGHT_OFF 作為高度
+            rpc_first = RPC(context["rpc"][:, 2, :])  # [B, 90]
+            h_center_ref = context["rpc"][:, 2, 8]   # HEIGHT_OFF 作為高度
             u_center = torch.full_like(h_center_ref, h / 2.0)
             v_center = torch.full_like(h_center_ref, w / 2.0)
             lat_ref_b, lon_ref_b = rpc_first.inverse(u_center, v_center, h_center_ref)  # [B]
@@ -202,7 +202,6 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             K_approx, c2w, distance_flat = rpc_flat.compute_camera_geometry(h, w, lat_ref_b, lon_ref_b)
             # distance_flat: [B*V]，reshape 為 [B, V] 供後續 per-view 使用
             distance_bv = rearrange(distance_flat, "(b v) -> b v", b=b, v=v)
-            w2c = torch.linalg.inv(c2w)
             # Update Context: Now depth_predictor will see these correct cameras!
             context["extrinsics"] = rearrange(c2w, "(b v) i j -> b v i j", b=b, v=v)
             context["intrinsics"] = rearrange(K_approx, "(b v) i j -> b v i j", b=b, v=v)
@@ -360,81 +359,89 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             
             rpc_all = RPC(repeat(context["rpc"], "b v c -> (b v r srf) c", r=r, srf=srf))
             lat_a, lon_a = rpc_all.inverse(u_all, v_all, h_all)
-            
-            # ============================================================
-            # [DEBUG] 驗證 3 個視角 RPC Inverse 結果是否重疊
-            # ============================================================
-            """
-            with torch.no_grad():
-                lat_per_view = rearrange(lat_a, "(b v r srf) -> b v (r srf)", b=b, v=v, r=r, srf=srf)
-                lon_per_view = rearrange(lon_a, "(b v r srf) -> b v (r srf)", b=b, v=v, r=r, srf=srf)
-                
-                print(f"\n{'='*70}")
-                print(f"[RPC INVERSE DEBUG] 3 視角經緯度比較 (Batch 0)")
-                print(f"{'='*70}")
-                
-                for vi in range(v):
-                    lat_v = lat_per_view[0, vi]
-                    lon_v = lon_per_view[0, vi]
-                    # 各視角的 RPC 原始 LAT_OFF / LONG_OFF
-                    rpc_lat_off = context["rpc"][0, vi, 4].item()
-                    rpc_lon_off = context["rpc"][0, vi, 6].item()
-                    print(f"\n  View {vi}:")
-                    print(f"    RPC params:  LAT_OFF={rpc_lat_off:.8f}, LON_OFF={rpc_lon_off:.8f}")
-                    print(f"    Inverse結果: lat=[{lat_v.min().item():.8f}, {lat_v.max().item():.8f}], mean={lat_v.mean().item():.8f}")
-                    print(f"    Inverse結果: lon=[{lon_v.min().item():.8f}, {lon_v.max().item():.8f}], mean={lon_v.mean().item():.8f}")
-                
-                # 計算 view 間的重疊度
-                rad_c = 3.141592653589793 / 180.0
-                r_e = 6378137.0
-                cos_lat_ref = torch.cos(lat_per_view[0, 0].mean() * rad_c)
-                
-                print(f"\n  --- 視角間重疊分析 (轉換為公尺) ---")
-                for vi in range(v):
-                    for vj in range(vi + 1, v):
-                        lat_i, lon_i = lat_per_view[0, vi], lon_per_view[0, vi]
-                        lat_j, lon_j = lat_per_view[0, vj], lon_per_view[0, vj]
-                        
-                        # 中心點偏移 (公尺)
-                        dx = (lon_i.mean() - lon_j.mean()) * rad_c * r_e * cos_lat_ref
-                        dy = (lat_i.mean() - lat_j.mean()) * rad_c * r_e
-                        
-                        # 各自的 spatial extent (公尺)
-                        ext_i_x = (lon_i.max() - lon_i.min()) * rad_c * r_e * cos_lat_ref
-                        ext_j_x = (lon_j.max() - lon_j.min()) * rad_c * r_e * cos_lat_ref
-                        ext_i_y = (lat_i.max() - lat_i.min()) * rad_c * r_e
-                        ext_j_y = (lat_j.max() - lat_j.min()) * rad_c * r_e
-                        
-                        print(f"\n  View {vi} vs View {vj}:")
-                        print(f"    中心偏移: dx={dx.item():.2f}m, dy={dy.item():.2f}m")
-                        print(f"    View {vi} 覆蓋範圍: {ext_i_x.item():.2f}m × {ext_i_y.item():.2f}m")
-                        print(f"    View {vj} 覆蓋範圍: {ext_j_x.item():.2f}m × {ext_j_y.item():.2f}m")
-                        
-                        # 判斷重疊
-                        avg_ext = (ext_i_x + ext_j_x).item() / 2
-                        shift = (dx.abs() + dy.abs()).item()
-                        if shift < avg_ext * 0.1:
-                            print(f"    ✅ 高度重疊 (偏移僅 {shift:.2f}m vs 範圍 {avg_ext:.2f}m)")
-                        elif shift < avg_ext * 0.5:
-                            print(f"    ⚠️ 部分重疊 (偏移 {shift:.2f}m vs 範圍 {avg_ext:.2f}m)")
-                        else:
-                            print(f"    ❌ 幾乎不重疊！(偏移 {shift:.2f}m >> 範圍 {avg_ext:.2f}m)")
-                
-                print(f"\n{'='*70}\n")
-                # ehoprwtjoptw = input()"""
+
+     
             # ENU Origin: 使用先前計算並存儲的圖像中心經緯度
-            lat_ref_b = context["_lat_ref"]  # [B]
-            lon_ref_b = context["_lon_ref"]  # [B]
+            # lat_ref_b = context["_lat_ref"]  # [B]
+            # lon_ref_b = context["_lon_ref"]  # [B]
+            # h_ref_a = repeat(repeat(context["rpc"][:, 0, 8], "b -> b v", v=1)[:, 0],"b -> (b v r srf)", v=v, r=r, srf=srf,)
+
+            # 用jax_004 的enu 原點 ： [30.357821655028108, -81.70643392476823, -47.180099999999996]
+            device = torch.device('cuda:0')
+
+            lat_ref_b = torch.tensor([30.357821655028108], device=device)
+            lon_ref_b = torch.tensor([-81.70643392476823], device=device)
+            h_ref_a   = torch.tensor([-47.180099999999996], device=device)
+
+
             lat_ref_a = repeat(lat_ref_b, "b -> (b v r srf)", v=v, r=r, srf=srf)
             lon_ref_a = repeat(lon_ref_b, "b -> (b v r srf)", v=v, r=r, srf=srf)
-            
+
             rad = 3.141592653589793 / 180.0
             r_earth = 6378137.0
             cos_lat_a = torch.cos(lat_ref_a * rad)
-            
-            x_a = (lon_a - lon_ref_a) * rad * r_earth * cos_lat_a
-            y_a = (lat_a - lat_ref_a) * rad * r_earth
-            z_a = h_all
+
+            coor_enu = True
+            if coor_enu:
+                # ============================================================
+                # 正確的 ENU 轉換（基於 WGS84 橢球體 + ECEF 旋轉矩陣）
+                # 步驟：
+                #   1. 將點 (lat_a, lon_a, h_all) 轉到 ECEF
+                #   2. 將參考點 (lat_ref, lon_ref, h_ref) 轉到 ECEF
+                #   3. 計算 ECEF 差向量 dX, dY, dZ
+                #   4. 用參考點的旋轉矩陣將 dXYZ 旋轉到 ENU
+                # 與近似平面版本的差異：
+                #   - 使用 WGS84 橢球體（非球體），考慮 N(lat) 的曲率半徑
+                #   - Z（Up）= 相對於 reference 高度的偏移，不是絕對 MSL
+                #   - 不使用 cos(lat_ref) 作為全局常數近似，而是精確的 3D 旋轉
+                # ============================================================
+                WGS84_A  = 6378137.0
+                WGS84_F  = 1.0 / 298.257223563
+                WGS84_E2 = 2 * WGS84_F - WGS84_F ** 2
+
+                
+                
+                # --- 點 (lat_a, lon_a, h_all) → ECEF ---
+                lat_a_rad = lat_a * rad
+                lon_a_rad = lon_a * rad
+                N_a   = WGS84_A / torch.sqrt(1.0 - WGS84_E2 * torch.sin(lat_a_rad) ** 2)
+                X_a   = (N_a + h_all)                    * torch.cos(lat_a_rad) * torch.cos(lon_a_rad)
+                Y_a   = (N_a + h_all)                    * torch.cos(lat_a_rad) * torch.sin(lon_a_rad)
+                Z_a   = (N_a * (1.0 - WGS84_E2) + h_all) * torch.sin(lat_a_rad)
+                # --- 參考點 (lat_ref, lon_ref, h_ref) → ECEF ---
+                lat_ref_rad = lat_ref_a * rad
+                lon_ref_rad = lon_ref_a * rad
+                N_ref = WGS84_A / torch.sqrt(1.0 - WGS84_E2 * torch.sin(lat_ref_rad) ** 2)
+                X_ref = (N_ref + h_ref_a)                     * torch.cos(lat_ref_rad) * torch.cos(lon_ref_rad)
+                Y_ref = (N_ref + h_ref_a)                     * torch.cos(lat_ref_rad) * torch.sin(lon_ref_rad)
+                Z_ref = (N_ref * (1.0 - WGS84_E2) + h_ref_a) * torch.sin(lat_ref_rad)
+                # 為了雙重確認 ECEF 轉換的一致性，也請印出參考點的 ECEF 座標
+
+                dX = X_a - X_ref
+                dY = Y_a - Y_ref
+                dZ = Z_a - Z_ref
+
+                # --- ECEF → ENU 旋轉矩陣（以參考點為中心）---
+                # R = [[-sin_lon,             cos_lon,            0      ],
+                #      [-sin_lat*cos_lon, -sin_lat*sin_lon,  cos_lat],
+                #      [ cos_lat*cos_lon,  cos_lat*sin_lon,  sin_lat]]
+                sin_lat = torch.sin(lat_ref_rad)
+                cos_lat = torch.cos(lat_ref_rad)
+                sin_lon = torch.sin(lon_ref_rad)
+                cos_lon = torch.cos(lon_ref_rad)
+
+                x_a = -sin_lon * dX + cos_lon * dY                                        # East  (m)
+                y_a = -sin_lat * cos_lon * dX - sin_lat * sin_lon * dY + cos_lat * dZ     # North (m)
+                z_a =  cos_lat * cos_lon * dX + cos_lat * sin_lon * dY + sin_lat * dZ     # Up    (m, 相對 h_ref)
+            else:
+                # ============================================================
+                # 原本的近似平面計算（flat-earth approximation，保留供對比）
+                # 注意：z_a 此版本為絕對 MSL 高度，非 ENU Up 分量
+                # ============================================================
+                x_a = (lon_a - lon_ref_a) * rad * r_earth * cos_lat_a
+                y_a = (lat_a - lat_ref_a) * rad * r_earth
+                z_a = h_all
+
             means = torch.stack([x_a, y_a, z_a], dim=-1)
 
             # 3. Gaussian Adapter: Use 1.0 as depth because virtual camera is 1m from ground
@@ -465,6 +472,10 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             # ============================================================
             # [DEBUG] 將中間 25% 面積的 Gaussians 染成紅色 (驗證中心投影)
             # ============================================================
+            DEBUG_SCALE = False #scaling all of the gaussians to be greater,since camera is really far away 
+            if DEBUG_SCALE:
+                scale_factor = 1000.0
+                gaussians.scales *= scale_factor
             DEBUG_CENTER_COLOR = False
             if DEBUG_CENTER_COLOR:
                 # 取得所有 Gaussians 的 X, Y 座標
@@ -548,30 +559,12 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
         visualization_dump["depth_highres"] = visualization_dump.get("depth_highres_raw")
 
         gaussians_obj = Gaussians(
-            rearrange(
-                gaussians.means,
-                "b v r srf spp xyz -> b (v r srf spp) xyz",
-            ),
-            rearrange(
-                gaussians.covariances,
-                "b v r srf spp i j -> b (v r srf spp) i j",
-            ),
-            rearrange(
-                gaussians.harmonics,
-                "b v r srf spp c d_sh -> b (v r srf spp) c d_sh",
-            ),
-            rearrange(
-                opacity_multiplier * gaussians.opacities,
-                "b v r srf spp -> b (v r srf spp)",
-            ),
-            rearrange(
-                gaussians.scales,
-                "b v r srf spp xyz -> b (v r srf spp) xyz",
-            ),
-            rearrange(
-                gaussians.rotations,
-                "b v r srf spp xyzw -> b (v r srf spp) xyzw",
-            ),
+            rearrange(gaussians.means,"b v r srf spp xyz -> b (v r srf spp) xyz",),
+            rearrange(gaussians.covariances,"b v r srf spp i j -> b (v r srf spp) i j",),
+            rearrange(gaussians.harmonics,"b v r srf spp c d_sh -> b (v r srf spp) c d_sh",),
+            rearrange(opacity_multiplier * gaussians.opacities, "b v r srf spp -> b (v r srf spp)",),
+            rearrange(gaussians.scales,"b v r srf spp xyz -> b (v r srf spp) xyz", ),
+            rearrange(gaussians.rotations,"b v r srf spp xyzw -> b (v r srf spp) xyzw", ),
         )
         
         # === [INFO] 印出最終 Gaussians 物件資訊 ===
@@ -644,11 +637,6 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
                 patch_size=self.cfg.shim_patch_size
                 * self.cfg.downscale_factor,
             )
-
-            # if self.cfg.apply_bounds_shim:
-            #     _, _, _, h, w = batch["context"]["image"].shape
-            #     near_disparity = self.cfg.near_disparity * min(h, w)
-            #     batch = apply_bounds_shim(batch, near_disparity, self.cfg.far_disparity)
 
             return batch
 

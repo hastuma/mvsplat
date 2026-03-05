@@ -42,7 +42,22 @@ def get_projection_matrix(
     result[:, 2, 2] = far / (far - near)
     result[:, 2, 3] = -(far * near) / (far - near)
     return result
-
+def get_projection_matrix_asymmetric(K, near, far, W, H):
+    # fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
+    fx = K[..., 0, 0]
+    fy = K[..., 1, 1]
+    cx = K[..., 0, 2]
+    cy = K[..., 1, 2]
+    (b,) = near.shape
+    res = torch.zeros((b, 4, 4), dtype=torch.float32, device=near.device)
+    res[:, 0, 0] = 2 * fx / W
+    res[:, 1, 1] = 2 * fy / H
+    res[:, 0, 2] = (2 * cx / W) - 1.0 # 關鍵：非 0
+    res[:, 1, 2] = (2 * cy / H) - 1.0 # 關鍵：非 0
+    res[:, 2, 2] = far / (far - near)
+    res[:, 2, 3] = -(far * near) / (far - near)
+    res[:, 3, 2] = 1.0
+    return res
 
 def render_cuda(
     extrinsics: Float[Tensor, "batch 4 4"],
@@ -89,11 +104,13 @@ def render_cuda(
     b, _, _ = extrinsics.shape
     h, w = image_shape
 
-    fov_x, fov_y = get_fov(intrinsics).unbind(dim=-1)
+    fov_x, fov_y = get_fov(intrinsics,h).unbind(dim=-1)
     tan_fov_x = (0.5 * fov_x).tan()
     tan_fov_y = (0.5 * fov_y).tan()
+    # grewg = input(f"fov x= {fov_x} \nfov y , {fov_y}\ntan_fov_x : {tan_fov_x} \ntan_fov_y : {tan_fov_y}\n in render_cuda, press Enter to continue...")
 
-    projection_matrix = get_projection_matrix(near, far, fov_x, fov_y)
+    # projection_matrix = get_projection_matrix(near, far, fov_x, fov_y)
+    projection_matrix=get_projection_matrix_asymmetric(intrinsics, near, far, w, h)
     projection_matrix = rearrange(projection_matrix, "b i j -> b j i")
     view_matrix = rearrange(extrinsics.inverse(), "b i j -> b j i")
     full_projection = view_matrix @ projection_matrix

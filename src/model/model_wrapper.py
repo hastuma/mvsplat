@@ -148,26 +148,69 @@ class ModelWrapper(LightningModule):
             
             # 從 RPC Jacobian 推導虛擬相機幾何（完全 Data-driven，無 hardcoded 參數）
             K_tgt, c2w_tgt, distance_tgt_flat = rpc_target_flat.compute_camera_geometry(h, w, lat_ref_flat, lon_ref_flat)
+            # --- 研究員級 Hardcode 覆寫：針對 Patch (0, 3) 且對齊 3DGS 局部 ENU ---
 
-            # --- Hardcoded camera parameters for debugging ---
-            K_tgt = torch.tensor([[
-                [1187255.75952377,   0.0,                113722.91093382722],
-                [0.0,                1178055.401262924,  -194568.0592035301],
-                # [1187255.75952377, 0.0,              112954.91093382722], // 算過的，第0,3 個
-                # [0.0,              1178055.401262924, -194568.0592035301],
-                [0.0,              0.0,               1.0              ],
-            ]], dtype=K_tgt.dtype, device=K_tgt.device)
-            c2w_tgt = torch.linalg.inv(torch.tensor([[
-                [0.8867532204124197,  -0.009486012188437915,  0.4621458013018875,  -37477.919892478676],
-                [0.10741489563426863, -0.9681921197734719,   -0.22597800646175822,  65542.12029332563 ],
-                [0.4495895531304993,   0.25002806798700034,  -0.8575285411778468,   394736.3683483885 ],
-                [0.0,                  0.0,                   0.0,                  1.0               ],
-            ]], dtype=c2w_tgt.dtype, device=c2w_tgt.device))
-            # Since RPC and Image are both (h, w), no further scaling of K is needed for projection.
-            # Just ensure the batch is updated with these consistent matrices.
+            device = K_tgt.device
+            dtype = K_tgt.dtype
+            B = K_tgt.shape[0]
+            # satellite sfm 算出來的相機矩陣是, cost volume和這個相機矩陣都使用了同一個enu 坐標系 
+            # {
+                # "K": [
+                #     1187255.75952377,     0.0,                    113722.91093382722,    
+                #     0.0,                  1178055.401262924,      -194568.0592035301,     
+                #     0.0,                  0.0,                    1.0,                                      
+                # ],
+                # "W2C": 
+                # [
+                #     0.8867532204124197,      -0.009486012188437915,       0.4621458013018875,       -37477.919892478676,    
+                #     0.10741489563426863,     -0.9681921197734719,         -0.22597800646175822,     65542.12029332563,   
+                #     0.4495895531304993,      0.25002806798700034,         -0.8575285411778468,      394736.3683483885,
+                #     0.0,                     0.0,                         0.0,                      1.0
+                # ]
+            # }
+            # 1. 內參 K 修正：扣除 Patch (0, 3) 的像素偏移
+            x_offset =  4 * 256 #6.05+
+            y_offset = 0#17.
+            fx = 1187255.75952377
+            fy = 1178055.401262924
+            cx_patch = 113722.91093382722 - x_offset
+            cy_patch = -194568.0592035301 - y_offset
+            K_patch = torch.tensor([
+                [fx,  0.0, cx_patch],
+                [0.0, fy,  cy_patch],
+                [0.0, 0.0, 1.0     ]
+            ], device=device, dtype=dtype)
+
+            global_w2c = torch.tensor([
+                [0.8867532204124197, -0.009486012188437915, 0.4621458013018875, -37477.919892478676],
+                [0.10741489563426863, -0.9681921197734719, -0.22597800646175822, 65542.12029332563],
+                [0.4495895531304993, 0.25002806798700034, -0.8575285411778468, 394736.3683483885],
+                [0.0, 0.0, 0.0, 1.0]
+            ], device=device, dtype=dtype)
+
+            global_c2w = torch.inverse(global_w2c)
+            
+            R_global = global_w2c[:3, :3]
+            T_global = global_w2c[:3, 3]
+
+            # 測試：世界座標原點 [0, 0, 0] 應該投影到哪裡？
+            test_point = torch.tensor([41, 295, 27, 1.0], device=device)
+            point_cam = torch.matmul(global_w2c, test_point) # 轉到相機座標
+            print(f"Test Point in Camera Space: {point_cam}")
+            # 投影到像素 (使用 K)
+            u = (fx * point_cam[0] / point_cam[2]) + cx_patch
+            v = (fy * point_cam[1] / point_cam[2]) + cy_patch
+
+            print(f"Projected Pixel (u, v): ({u.item():.2f}, {v.item():.2f})")
+            # exit()
+            # 3. 覆寫變數並擴展至 Batch
+            K_tgt = K_patch.unsqueeze(0).expand(B, 3, 3).contiguous()
+            c2w_tgt = global_c2w.unsqueeze(0).expand(B, 4, 4).contiguous()
+
+            # # 衛星影像焦距極長，distance_tgt 僅作為 Near/Far 平面參考，設為常數即可
+            distance_tgt_flat = torch.full((B,), 394736.3683483885, device=device, dtype=dtype)
             batch["target"]["extrinsics"] = rearrange(c2w_tgt, "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
             batch["target"]["intrinsics"] = rearrange(K_tgt, "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
-            
             # 保存 distance 供後續計算 near/far 使用（避免重複呼叫 compute_camera_geometry）
             distance_tgt = rearrange(distance_tgt_flat, "(b v) -> b v", b=b_tgt, v=v_tgt)
             
@@ -267,7 +310,7 @@ class ModelWrapper(LightningModule):
         if "rpc" in batch["context"] and "rpc" in batch["target"]:
             # 直接使用 Block 1 已計算的 distance_tgt，無需重複呼叫 compute_camera_geometry
             h_off_tgt = batch["target"]["rpc"][:, :, 8]    # HEIGHT_OFF [B, V_target]
-            scene_range = 20.0  # ±20m 場景範圍（與 encoder_costvolume 一致）
+            scene_range = 50000.0  # ±20m 場景範圍（與 encoder_costvolume 一致）
             scene_z_min = h_off_tgt - scene_range
             scene_z_max = h_off_tgt + scene_range
             
@@ -277,13 +320,17 @@ class ModelWrapper(LightningModule):
             # Near/Far 定義（相機到場景的距離）
             render_near = (camera_z_tgt - scene_z_max).clamp(min=1.0)
             render_far = (camera_z_tgt - scene_z_min).clamp(min=render_near + 1.0)
-            
+            # print(f"h_off_tgt : {h_off_tgt} ")
+            # print(f"distance_tgt (相機到地面的距離): {distance_tgt_flat} 米")
+            # print(f"scene_z_min: {scene_z_min}, scene_z_max: {scene_z_max}") 
+            # print(f"render_near: {render_near}, render_far: {render_far}")
+            # gkrewp= input("jeoghpwt")
         else:
             render_near = batch["target"]["near"]
             render_far = batch["target"]["far"]
         
-        render_near = torch.full_like(render_near, 1.0, dtype=torch.float32)
-        render_far = torch.full_like(render_far, 10000.0, dtype=torch.float32)
+        # render_near = torch.full_like(render_near, 1.0, dtype=torch.float32)
+        # render_far = torch.full_like(render_far, 10000.0, dtype=torch.float32)
         # 手動建立一個 3x3 內參矩陣
         # 手動建立一個 3x3 內參矩陣
         # device = batch["target"]["intrinsics"].device

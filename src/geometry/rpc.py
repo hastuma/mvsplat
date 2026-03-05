@@ -298,7 +298,7 @@ class RPC:
         lon_ref = lon_c  if lon_ref_global is None else lon_ref_global
         r_earth, rad = 6378137.0, 3.1415926535 / 180.0
         print("lat_ref:", lat_ref, "lon_ref:", lon_ref)
-        exit()
+        # exit()
         # ENU 座標（相對於 ENU 原點）
         x_c = (lon_c - lon_ref) * rad * r_earth * torch.cos(lat_ref * rad)  # 東
         y_c = (lat_c  - lat_ref) * rad * r_earth                             # 北

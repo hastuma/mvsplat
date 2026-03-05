@@ -80,12 +80,11 @@ def warp_with_rpc(
     u_ref = u_ref.unsqueeze(0).unsqueeze(0).expand(b, d, h, w)
     v_ref = v_ref.unsqueeze(0).unsqueeze(0).expand(b, d, h, w)
     print("\n" + "="*30 + " [RPC WARP CHECK] " + "="*30)
-    print(f"1. Scale Info: Feature Map {w}x{h} | Scale Factor: {scale_factor}")
+
     
     # 檢驗 Ref RPC 參數
     # Index 0: LINE_OFF (應該有大幅度位移，可能是負數)
     # Index 4: LAT_OFF (應該是全域值，例如 30.360...)
-    print(f"2. Ref RPC Params (First 10):")
     print(f"   LINE_OFF (idx0): {rpc0[0, 0].item():.4f} <--- Check if shifted")
     print(f"   LAT_OFF  (idx4): {rpc0[0, 4].item():.10f} <--- Check global precision")
     
@@ -105,25 +104,10 @@ def warp_with_rpc(
     
     # [反投影] Ref (u,v,z) -> World (lat,lon)
     # 使用較高的迭代次數確保精度
-    lat, lon = rpc_ref_obj.inverse(v_ref, u_ref, depth, iterations=50)
+    lat, lon = rpc_ref_obj.inverse(v_ref, u_ref, depth, iterations=100)
 
     # [正投影] World (lat,lon) -> Src (u,v)
     v_src_raw, u_src_raw = rpc_src_obj.forward(lat, lon, depth)
-
-    # --- [DEBUG] 自我投影檢查 (Self-Projection Check) ---
-    # 理論上：Ref -> World -> Ref 應該要變回原本的坐標
-    # 這是檢驗 RPC 參數是否崩壞的最好方法
-    with torch.no_grad():
-        v_check, u_check = rpc_ref_obj.forward(lat, lon, depth)
-        diff_u = torch.abs(u_check - u_ref)
-        diff_v = torch.abs(v_check - v_ref)
-        max_diff = torch.max(diff_u + diff_v).item()
-        
-        print(f"4. Self-Projection Error: {max_diff:.6f} pixels")
-        if max_diff > 1.0:
-            print("   [WARNING] 自我投影誤差過大！請檢查 RPC 參數或高度範圍。")
-        else:
-            print("   [OK] 自我投影幾何閉環成功。")
 
     # --- 3. 座標還原與歸一化 ---
     # 從 256px 空間轉回 64px 特徵空間
@@ -455,9 +439,6 @@ class DepthPredictorMultiView(nn.Module):
             
             for feat10, rpc_pair in zip(feat_comb_lists[1:], rpc_curr_lists):
                 ref_rpc_data, src_rpc_data = rpc_pair
-                print(f"\n[WARP DEBUG] Processing View Pair:")
-                print(f"  > Ref View LINE_SCALE: {ref_rpc_data[0, 1].item():.1f}")
-                print(f"  > Src View LINE_SCALE: {src_rpc_data[0, 1].item():.1f}")
                 h_off = ref_rpc_data[:, 8:9].unsqueeze(-1).unsqueeze(-1)  # [vB, 1, 1, 1]
                 # 使用 RPC Jacobian 推導的虛擬相機高度（非 hardcode 100m）
                 if virtual_cam_dist_vb is not None:
@@ -467,7 +448,6 @@ class DepthPredictorMultiView(nn.Module):
                 else:
                     H_derived = torch.full_like(h_off, 44.8)  # fallback ≈ 128×0.35m
                 cam_msl = h_off + H_derived
-                print(f"  > cam_msl (center): {cam_msl[0,0,0,0].item():.2f}m  (H_derived={H_derived[0,0,0,0].item():.2f}m)")
 
                 # Convert distance -> altitude for warping
                 height_candi = cam_msl - disp_candi_curr  # [vB, D, 1, 1]
@@ -556,16 +536,10 @@ class DepthPredictorMultiView(nn.Module):
                 # exit()
 
             # 把cost volume 跟 Ref feature 結合，讓 U-Net 可以同時看到兩者資訊
-            # print("raw_correlation_in shape[before concat]:", raw_correlation_in.shape)
-            # print("feat01 shape:", feat01.shape)
             raw_correlation_in = torch.cat((raw_correlation_in, feat01), dim=1)
 
         # refine cost volume via 2D u-net
         raw_correlation = self.corr_refine_net(raw_correlation_in)  # (vb d h w)
-        # apply skip connection
-        # print("raw_correlation_in shape:", raw_correlation_in.shape)
-        # print("raw_correlation shape:", raw_correlation.shape)
-        # exit()
         raw_correlation += self.regressor_residual(raw_correlation_in)
 
         # softmax to get coarse depth and density
@@ -573,12 +547,7 @@ class DepthPredictorMultiView(nn.Module):
         coarse_disps = (disp_candi_curr * pdf).sum(dim=1, keepdim=True)  # (vb, 1, h, w)
         pdf_max = torch.max(pdf, dim=1, keepdim=True)[0]  # argmax
         pdf_max = F.interpolate(pdf_max, scale_factor=self.upscale_factor)
-        fullres_disps = F.interpolate(
-            coarse_disps,
-            scale_factor=self.upscale_factor,
-            mode="bilinear",
-            align_corners=True,
-        )
+        fullres_disps = F.interpolate(coarse_disps, scale_factor=self.upscale_factor,mode="bilinear", align_corners=True,)
 
         if visualization_dump is not None:
             visualization_dump["depth_lowres_raw"] = coarse_disps
@@ -608,7 +577,6 @@ class DepthPredictorMultiView(nn.Module):
                 rearrange(distance_near, "b v -> (v b) () () ()"),
                 rearrange(distance_far, "b v -> (v b) () () ()"),
             )
-            # 【嚴重修正】: 移除 1.0 / fine_disps
             # fine_disps 已經是 Metric Distance (公尺)，直接當作 depth 使用
             depths = fine_disps 
             depths = repeat(depths, "(v b) dpt h w -> b v (h w) srf dpt", b=b, v=v, srf=1)

@@ -230,7 +230,7 @@ def intersect_rays(
     return result_all
 
 
-def get_fov(intrinsics: Float[Tensor, "batch 3 3"]) -> Float[Tensor, "batch 2"]:
+def get_fov(intrinsics: Float[Tensor, "batch 3 3"],h) -> Float[Tensor, "batch 2"]:
     intrinsics_inv = intrinsics.inverse()
 
     def process_vector(vector):
@@ -238,10 +238,15 @@ def get_fov(intrinsics: Float[Tensor, "batch 3 3"]) -> Float[Tensor, "batch 2"]:
         vector = einsum(intrinsics_inv, vector, "b i j, j -> b i")
         return vector / vector.norm(dim=-1, keepdim=True)
 
-    left = process_vector([0, 0.5, 1])
-    right = process_vector([1, 0.5, 1])
-    top = process_vector([0.5, 0, 1])
-    bottom = process_vector([0.5, 1, 1])
-    fov_x = (left * right).sum(dim=-1).acos()
-    fov_y = (top * bottom).sum(dim=-1).acos()
+    # left = process_vector([0, 0.5, 1])
+    # right = process_vector([1, 0.5, 1])
+    # top = process_vector([0.5, 0, 1])
+    # bottom = process_vector([0.5, 1, 1])
+    # fov_x = (left * right).sum(dim=-1).acos()
+    # fov_y = (top * bottom).sum(dim=-1).acos()
+
+    fx = intrinsics[..., 0, 0]
+    fy = intrinsics[..., 1, 1]
+    fov_x = 2 * torch.atan(0.5 * h / fx)
+    fov_y = 2 * torch.atan(0.5 * h / fy)
     return torch.stack((fov_x, fov_y), dim=-1)
