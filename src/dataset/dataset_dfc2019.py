@@ -7,7 +7,7 @@ import numpy as np
 from osgeo import gdal
 from typing import Literal, Any
 from dataclasses import dataclass
-
+import json
 from .types import UnbatchedExample, UnbatchedViews
 from .view_sampler import ViewSampler
 from .dataset import DatasetCfgCommon
@@ -43,10 +43,8 @@ class DFC2019Dataset(Dataset):
         }
         folder_name = stage_map.get(stage, "training")
         self.stage_dir = self.root_dir / folder_name
-        
+        self.enu_origin_dir = self.root_dir / "enu_origin" 
         if not self.stage_dir.exists():
-             # Fallback or error
-             print(f"Warning: {self.stage_dir} does not exist. trying root directly")
              self.stage_dir = self.root_dir
 
         # Identify all scene directories
@@ -79,7 +77,7 @@ class DFC2019Dataset(Dataset):
 
     def __getitem__(self, index):
         scene_dir = self.scenes[index]
-        files = sorted(list(scene_dir.glob("*.tif")))
+        files = sorted(list(scene_dir.glob("*.tif")))#4張會拿前三張當context，最後一張當target
         if len(files) < 4:
             # Need at least 3 context + 1 target
             return self.__getitem__((index + 1) % len(self))
@@ -102,6 +100,16 @@ class DFC2019Dataset(Dataset):
             context_indices = torch.arange(num_context)
             target_indices = torch.arange(num_context, num_context+num_target)
 
+        # 只讀取一次 enu_origin (同一 scene 的所有 view 都相同)
+        scene = "_".join(files[0].name.split("_")[:2])
+        enu_origin_path = self.enu_origin_dir / f"{scene}.json"
+        with open(enu_origin_path, "r") as f:
+            enu_data = json.load(f) #[30.357821655028108, -81.70643392476823, -47.180099999999996]
+        
+        enu_origin_tensor = torch.tensor(
+            [enu_data[0], enu_data[1], enu_data[2]],
+            dtype=torch.float32
+        )
         # Helper to load
         def load_view(idx):
             fpath = files[idx]
@@ -123,7 +131,7 @@ class DFC2019Dataset(Dataset):
             
             # 轉回 Tensor (必須保持 float64 以避免精度丟失)
             rpc_tensor = torch.from_numpy(rpc_coeff).double()
-            return tensor_img, rpc_tensor # 確保回傳兩個值！
+            return tensor_img, rpc_tensor
 
         context_images, context_rpcs = [], []
         target_images, target_rpcs = [], []
@@ -132,22 +140,27 @@ class DFC2019Dataset(Dataset):
             img, rpc = load_view(idx.item())
             context_images.append(img)
             context_rpcs.append(rpc)
-            
+        
         for idx in target_indices:
+            # 這邊的scene_dir 會是像”/project/winston/datasets/DFC2019/geo_cropped/training/JAX_004_012_p0406“
+            # 所以讀file時要先讀主圖，也就是JAX_004_012 , 
             img, rpc = load_view(idx.item())
             target_images.append(img)
             target_rpcs.append(rpc)
-            
+        
         images = context_images + target_images
         rpcs = context_rpcs + target_rpcs
         
         images = torch.stack(images) # [V, C, H, W]
         rpcs = torch.stack(rpcs)     # [V, 90]
         
-        # Images are already resized in load_view
-            
-        # Define dimensions and placeholders
+        # 複製 enu_origin 給所有 view (同一 scene 的所有 view 都相同)
         V, C, H, W = images.shape
+        enu_origins = enu_origin_tensor.unsqueeze(0).repeat(V, 1)  # [V, 3]
+        
+        # Images are already resized in load_view
+        
+        # Define dimensions and placeholders
         extrinsics = torch.eye(4).unsqueeze(0).repeat(V, 1, 1)
         intrinsics = torch.eye(3).unsqueeze(0).repeat(V, 1, 1)
         
@@ -161,6 +174,7 @@ class DFC2019Dataset(Dataset):
         # Indices in 'images' stack: 0..2 are context, 3 is target
         
         context_views = []
+
         for i in range(num_context):
             context_views.append({
                 "extrinsics": extrinsics[i],
@@ -169,11 +183,19 @@ class DFC2019Dataset(Dataset):
                 "near": near[i],
                 "far": far[i],
                 "index": indices[i],
-                "rpc": rpcs[i]
+                "rpc": rpcs[i],
+                "enu_origin": enu_origins[i]
             })
             
         target_views = []
         for i in range(num_context, V):
+            image_name = os.path.splitext(os.path.basename(files[i]))[0]
+
+            # 取得資料夾名稱
+            folder = os.path.basename(os.path.dirname(files[i]))# folder = JAX_004_012_p0406
+            patch = folder.split("_")[-1]   # p0406
+            py = int(patch[1:3])  # 04 -> 4
+            px = int(patch[3:5])  # 06 -> 6
             target_views.append({
                 "extrinsics": extrinsics[i],
                 "intrinsics": intrinsics[i],
@@ -181,9 +203,13 @@ class DFC2019Dataset(Dataset):
                 "near": near[i],
                 "far": far[i],
                 "index": indices[i],
-                "rpc": rpcs[i]
+                "rpc": rpcs[i],
+                "enu_origin": enu_origins[i],
+                "image_name": image_name , # Add image name for target views
+                "px": px,  # Add pixel x coordinate
+                "py": py   # Add pixel y coordinate
             })
-
+            
         return {
             "context": {
                 "extrinsics": torch.stack([v["extrinsics"] for v in context_views]),
@@ -193,6 +219,7 @@ class DFC2019Dataset(Dataset):
                 "far": torch.stack([v["far"] for v in context_views]),
                 "index": torch.stack([v["index"] for v in context_views]),
                 "rpc": torch.stack([v["rpc"] for v in context_views]),
+                "enu_origin": torch.stack([v["enu_origin"] for v in context_views]),
             },
             "target": {
                 "extrinsics": torch.stack([v["extrinsics"] for v in target_views]),
@@ -202,6 +229,10 @@ class DFC2019Dataset(Dataset):
                 "far": torch.stack([v["far"] for v in target_views]),
                 "index": torch.stack([v["index"] for v in target_views]),
                 "rpc": torch.stack([v["rpc"] for v in target_views]),
+                "enu_origin": torch.stack([v["enu_origin"] for v in target_views]),
+                "image_name": [v["image_name"] for v in target_views],
+                "px": [v["px"] for v in target_views],
+                "py": [v["py"] for v in target_views]
             },
             "scene": scene_dir.name,
         }

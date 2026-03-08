@@ -124,7 +124,7 @@ def train(cfg_dict: DictConfig):
             wandb.run.log_code("src")
     else:
         logger = LocalLogger(output_dir)
-    # Set up checkpointing.
+    # Set up checkpointing.～
     callbacks.append(
         ModelCheckpoint(
             output_dir / "checkpoints",

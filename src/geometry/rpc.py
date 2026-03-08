@@ -273,15 +273,7 @@ class RPC:
         # 單位檢查：米 / (米/像素) = 像素 ✓
         focal = distance / gsd_rpc  # [B], pixels; 等價於 w/2
         
-        # === DEBUG: 驗證單位正確性 ===
-        print(f"\n[RPC GEOMETRY DEBUG]")
-        print(f"  GSD (from Jacobian): {gsd_rpc[0].item():.4f} m/px")
-        print(f"  Camera Height H = (w/2) × GSD = {w/2:.0f} × {gsd_rpc[0].item():.4f} = {distance[0].item():.2f} m")
-        print(f"  Focal f = H / GSD = {distance[0].item():.2f} / {gsd_rpc[0].item():.4f} = {focal[0].item():.2f} px")
-        print(f"  Expected: f ≈ w/2 = {w/2:.0f} px ✓" if abs(focal[0].item() - w/2) < 1 else f"  WARNING: focal != w/2")
-        print(f"  height_scale: {self.height_scale[0].item():.1f} m (RPC norm param)")
-        # input("  Press Enter to continue...")  # 暫停以檢查輸出
-        # 或者直接用 Jacobian: focal = K_jac.diagonal()[..., :2].mean()
+  
         
         # 建立 K
         K = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
@@ -297,8 +289,7 @@ class RPC:
         lat_ref = lat_c  if lat_ref_global is None else lat_ref_global
         lon_ref = lon_c  if lon_ref_global is None else lon_ref_global
         r_earth, rad = 6378137.0, 3.1415926535 / 180.0
-        print("lat_ref:", lat_ref, "lon_ref:", lon_ref)
-        # exit()
+        
         # ENU 座標（相對於 ENU 原點）
         x_c = (lon_c - lon_ref) * rad * r_earth * torch.cos(lat_ref * rad)  # 東
         y_c = (lat_c  - lat_ref) * rad * r_earth                             # 北
@@ -308,6 +299,5 @@ class RPC:
         c2w = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
         c2w[:, :3, :3] = R_c2w
         c2w[:, :3, 3] = torch.stack([x_c, y_c, z_c.to(dtype)], dim=-1)
-        print(f"camera position info - lat: {lat_c[0].item():.6f}, lon: {lon_c[0].item():.6f}, x: {x_c[0].item():.2f} m, y: {y_c[0].item():.2f} m, z: {z_c[0].item():.2f} m (MSL)")
-        # input()
+        
         return K.to(dtype=torch.float32), c2w.to(dtype=torch.float32), distance.to(dtype=torch.float32)

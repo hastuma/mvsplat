@@ -146,76 +146,135 @@ class ModelWrapper(LightningModule):
             
             rpc_target_flat = RPC(rearrange(batch["target"]["rpc"], "b v c -> (b v) c"))
             
-            # 從 RPC Jacobian 推導虛擬相機幾何（完全 Data-driven，無 hardcoded 參數）
-            K_tgt, c2w_tgt, distance_tgt_flat = rpc_target_flat.compute_camera_geometry(h, w, lat_ref_flat, lon_ref_flat)
-            # --- 研究員級 Hardcode 覆寫：針對 Patch (0, 3) 且對齊 3DGS 局部 ENU ---
-
-            device = K_tgt.device
-            dtype = K_tgt.dtype
-            B = K_tgt.shape[0]
-            # satellite sfm 算出來的相機矩陣是, cost volume和這個相機矩陣都使用了同一個enu 坐標系 
-            # {
-                # "K": [
-                #     1187255.75952377,     0.0,                    113722.91093382722,    
-                #     0.0,                  1178055.401262924,      -194568.0592035301,     
-                #     0.0,                  0.0,                    1.0,                                      
-                # ],
-                # "W2C": 
-                # [
-                #     0.8867532204124197,      -0.009486012188437915,       0.4621458013018875,       -37477.919892478676,    
-                #     0.10741489563426863,     -0.9681921197734719,         -0.22597800646175822,     65542.12029332563,   
-                #     0.4495895531304993,      0.25002806798700034,         -0.8575285411778468,      394736.3683483885,
-                #     0.0,                     0.0,                         0.0,                      1.0
-                # ]
-            # }
-            # 1. 內參 K 修正：扣除 Patch (0, 3) 的像素偏移
-            x_offset =  4 * 256 #6.05+
-            y_offset = 0#17.
-            fx = 1187255.75952377
-            fy = 1178055.401262924
-            cx_patch = 113722.91093382722 - x_offset
-            cy_patch = -194568.0592035301 - y_offset
-            K_patch = torch.tensor([
-                [fx,  0.0, cx_patch],
-                [0.0, fy,  cy_patch],
-                [0.0, 0.0, 1.0     ]
-            ], device=device, dtype=dtype)
-
-            global_w2c = torch.tensor([
-                [0.8867532204124197, -0.009486012188437915, 0.4621458013018875, -37477.919892478676],
-                [0.10741489563426863, -0.9681921197734719, -0.22597800646175822, 65542.12029332563],
-                [0.4495895531304993, 0.25002806798700034, -0.8575285411778468, 394736.3683483885],
-                [0.0, 0.0, 0.0, 1.0]
-            ], device=device, dtype=dtype)
-
-            global_c2w = torch.inverse(global_w2c)
+            target_name = batch["target"]["image_name"]
+            px = batch["target"]["px"]  
+            py = batch["target"]["py"]  
             
-            R_global = global_w2c[:3, :3]
-            T_global = global_w2c[:3, 3]
+            # ============================================================
+            # 從 JSON 檔案讀取 SatelliteSfM 相機參數（取代硬編碼）
+            # 數據結構: target_name[v_idx] = [b0_name, b1_name, ...] (tuple)
+            #          px[v_idx] = tensor([px_b0, px_b1, ...])
+            #          py[v_idx] = tensor([py_b0, py_b1, ...])
+            # ============================================================
+            device = batch["target"]["rpc"].device
+            dtype = torch.float32
+            B = b_tgt  
+            K_patches = []
+            c2ws = []
+            distance_vals = []
+            
+            # 按照 (b_idx, v_idx) 順序迭代，對應 flattened batch 維度
+            # 迴圈順序必須與 rearrange 時的展平順序一致
+            for b_idx in range(b_tgt):
+                for v_idx in range(v_tgt):
+                    # 獲取 (b_idx, v_idx) 的資訊
+                    img_name = target_name[v_idx][b_idx]
+                    px_val = px[v_idx][b_idx].item()
+                    py_val = py[v_idx][b_idx].item()
+                    
+                    # 構建 JSON 路徑
+                    scene_parts = str(img_name).split("_")
+                    scene_prefix = "_".join(scene_parts[:2])  # "JAX_004"
+                    camera_json_path = f"/project/winston/datasets/DFC2019/geo_cropped/camera_pose/{scene_prefix}_cameras/{img_name}.json"
+                    print(f"reading camera parameters from: {camera_json_path}")
+                    with open(camera_json_path, "r") as f:
+                        camera_data = json.load(f)
+                    
+                    # 解析 K（4x4 矩陣展平成 16 元素）和 W2C（4x4）
+                    K_full = torch.tensor(camera_data["K"], device=device, dtype=dtype).reshape(4, 4)
+                    w2c = torch.tensor(camera_data["W2C"], device=device, dtype=dtype).reshape(4, 4)
+                    
+                    # 提取 3x3 內參
+                    fx = K_full[0, 0]
+                    fy = K_full[1, 1]
+                    cx_global = K_full[0, 2]
+                    cy_global = K_full[1, 2]
+                    
+                    # 計算 patch offset（px, py 各乘以 256）
+                    x_offset = px_val * 256
+                    y_offset = py_val * 256
+                    print(f"x_offset = {x_offset:.2f}, y_offset = {y_offset:.2f}")
+                    print(f"Patch offset for batch {b_idx}: (x_offset={x_offset:.2f}, y_offset={y_offset:.2f})")
+                    # 修正主點：扣除 patch 偏移
+                    cx_patch = cx_global - x_offset
+                    cy_patch = cy_global - y_offset
+                    
+                    K_patch = torch.tensor([
+                        [fx,  0.0, cx_patch],
+                        [0.0, fy,  cy_patch],
+                        [0.0, 0.0, 1.0     ]
+                    ], device=device, dtype=dtype)
+                    
+                    c2w = torch.inverse(w2c)
+                    distance_val = w2c[2, 3].abs()
 
-            # 測試：世界座標原點 [0, 0, 0] 應該投影到哪裡？
-            test_point = torch.tensor([41, 295, 27, 1.0], device=device)
-            point_cam = torch.matmul(global_w2c, test_point) # 轉到相機座標
-            print(f"Test Point in Camera Space: {point_cam}")
-            # 投影到像素 (使用 K)
-            u = (fx * point_cam[0] / point_cam[2]) + cx_patch
-            v = (fy * point_cam[1] / point_cam[2]) + cy_patch
-
-            print(f"Projected Pixel (u, v): ({u.item():.2f}, {v.item():.2f})")
-            # exit()
-            # 3. 覆寫變數並擴展至 Batch
-            K_tgt = K_patch.unsqueeze(0).expand(B, 3, 3).contiguous()
-            c2w_tgt = global_c2w.unsqueeze(0).expand(B, 4, 4).contiguous()
-
-            # # 衛星影像焦距極長，distance_tgt 僅作為 Near/Far 平面參考，設為常數即可
-            distance_tgt_flat = torch.full((B,), 394736.3683483885, device=device, dtype=dtype)
+                    print(f"K{K_patch}")
+                    print(f"w2c{w2c}")
+                    print(f"c2w{c2w}")
+                    print(f"distance{distance_val}")
+                    # input()
+                    K_patches.append(K_patch)
+                    c2ws.append(c2w)
+                    distance_vals.append(distance_val)
+            
+            # Stack 成 batch tensor
+            K_tgt = torch.stack(K_patches)           # [B*V, 3, 3]
+            c2w_tgt = torch.stack(c2ws)              # [B*V, 4, 4]
+            distance_tgt_flat = torch.stack(distance_vals)  # [B*V]
+            
             batch["target"]["extrinsics"] = rearrange(c2w_tgt, "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
             batch["target"]["intrinsics"] = rearrange(K_tgt, "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
-            # 保存 distance 供後續計算 near/far 使用（避免重複呼叫 compute_camera_geometry）
+            # 保存 distance 供後續計算 near/far 使用
             distance_tgt = rearrange(distance_tgt_flat, "(b v) -> b v", b=b_tgt, v=v_tgt)
             
         gaussians, vis_dump = self.encoder(batch["context"], self.global_step, False, scene_names=batch["scene"])
         
+        # ============================================================
+        # 投影高斯中心到二維圖像進行驗證（支持 batch_size > 1）
+        # ============================================================
+        if "rpc" in batch["context"] and "rpc" in batch["target"]:
+            gaussian_center_world = gaussians.means.detach().mean(dim=1)  # [B, 3]
+            
+            # 對每個 batch 投影到對應的目標相機
+            for batch_idx in range(b_tgt):
+                
+                # 獲取該 batch 的第一個目標視角的相機參數
+                K_target = batch["target"]["intrinsics"][batch_idx, 0]  # [3, 3]
+                c2w_target = batch["target"]["extrinsics"][batch_idx, 0]  # [4, 4]
+                w2c_target = torch.inverse(c2w_target)  # [4, 4]
+                
+                # 高斯中心在世界坐標系（齐次坐标）
+                gs_center = gaussian_center_world[batch_idx]  # [3]
+                gs_center_homo = torch.cat([gs_center, torch.ones(1, device=device, dtype=dtype)])  # [4]
+                
+                # 轉換到相機坐標系
+                gs_center_cam = torch.matmul(w2c_target, gs_center_homo)  # [4]
+                
+                # 投影到像素坐標
+                fx_target = K_target[0, 0]
+                fy_target = K_target[1, 1]
+                cx_target = K_target[0, 2]
+                cy_target = K_target[1, 2]
+                
+                pixel_u = (fx_target * gs_center_cam[0] / gs_center_cam[2]) + cx_target
+                pixel_v = (fy_target * gs_center_cam[1] / gs_center_cam[2]) + cy_target
+                
+                # 計算到圖像中心的距離
+                image_center_u = w / 2.0
+                image_center_v = h / 2.0
+                distance_to_center = torch.sqrt((pixel_u - image_center_u)**2 + (pixel_v - image_center_v)**2)
+                
+                # 打印投影結果
+                # print(f"    世界坐標: [{gs_center[0].item():9.2f}, {gs_center[1].item():9.2f}, {gs_center[2].item():9.2f}]")
+                # print(f"    相機坐標: [{gs_center_cam[0].item():9.2f}, {gs_center_cam[1].item():9.2f}, {gs_center_cam[2].item():9.2f}]")
+                # print(f"    投影像素: ({pixel_u.item():7.2f}, {pixel_v.item():7.2f})")
+                # print(f"    圖像中心: ({image_center_u:7.2f}, {image_center_v:7.2f})")
+                # print(f"    距離中心: {distance_to_center.item():7.2f} 像素")
+                K_target[0,2]+=(128-pixel_u.item())
+                K_target[1,2]+=(128-pixel_v.item())
+                batch["target"]["intrinsics"][batch_idx, 0] = K_target
+                
+            
         # ============================================================
         # [RENDER DEBUG] 詳細輸出相機和 Gaussian 參數
         # ============================================================
@@ -320,33 +379,15 @@ class ModelWrapper(LightningModule):
             # Near/Far 定義（相機到場景的距離）
             render_near = (camera_z_tgt - scene_z_max).clamp(min=1.0)
             render_far = (camera_z_tgt - scene_z_min).clamp(min=render_near + 1.0)
-            # print(f"h_off_tgt : {h_off_tgt} ")
-            # print(f"distance_tgt (相機到地面的距離): {distance_tgt_flat} 米")
-            # print(f"scene_z_min: {scene_z_min}, scene_z_max: {scene_z_max}") 
-            # print(f"render_near: {render_near}, render_far: {render_far}")
-            # gkrewp= input("jeoghpwt")
         else:
             render_near = batch["target"]["near"]
             render_far = batch["target"]["far"]
         
-        # render_near = torch.full_like(render_near, 1.0, dtype=torch.float32)
-        # render_far = torch.full_like(render_far, 10000.0, dtype=torch.float32)
-        # 手動建立一個 3x3 內參矩陣
-        # 手動建立一個 3x3 內參矩陣
-        # device = batch["target"]["intrinsics"].device
-        # dtype = batch["target"]["intrinsics"].dtype
-        # new_K = torch.tensor([
-        #     [12, 0.0,        128.0],
-        #     [0.0,        12, 128.0],
-        #     [0.0,        0.0,        1.0  ]
-        # ], device=device, dtype=dtype)
-        # new_K_batched = new_K.unsqueeze(0).unsqueeze(0).expand(1, 3, 3, 3)
-        # print(f"render_near , render_far  before decoder forward : {render_near}, {render_far}")
+
         output = self.decoder.forward(
             gaussians,
             batch["target"]["extrinsics"],
             batch["target"]["intrinsics"],
-            # new_K,
             render_near,
             render_far,
             (h, w),
@@ -453,7 +494,6 @@ class ModelWrapper(LightningModule):
             # 注意：這個檢查是在 backward 之前執行的，所以它看到的是「上一個 step」的 gradient。
             # 在 validation interval 之後，gradient 可能被清空，這是正常的。
             if self.global_step > 0 and self.global_step % 10 == 0:
-                print(f"--- Gradient Check (Step {self.global_step}, from previous backward) ---")
                 grad_stats = {}
                 for name, param in self.encoder.named_parameters():
                     if param.grad is not None:
@@ -465,14 +505,7 @@ class ModelWrapper(LightningModule):
                             grad_stats[layer_name]['count'] += 1
                             grad_stats[layer_name]['max'] = max(grad_stats[layer_name]['max'], g_max)
                 
-                if grad_stats:
-                    print(" Gradient Flow by Layer:")
-                    for layer, stats in grad_stats.items():
-                        print(f"   {layer}: {stats['count']} params, max_grad={stats['max']:.2e}")
-                else:
-                    # 在 validation interval 後 gradient 被清空是正常的
-                    print(" INFO: No gradients from previous step (normal after validation or optimizer.step)")
-
+            
             # --- Mandatory 3DGS PLY Export for Debugging ---
             if self.global_step % 50 == 0:
                 from .ply_export import export_ply
@@ -497,7 +530,7 @@ class ModelWrapper(LightningModule):
                     opacities,
                     ply_path
                 )
-                print(f" [SAVE] Saved 3DGS PLY to: {ply_path}")
+
                 
                 # 額外保存完整 3DGS 數據為 .pt 格式（方便 Python 分析）
                 pt_path = ply_dir / f"step_{self.global_step:0>6}_full.pt"
@@ -515,7 +548,6 @@ class ModelWrapper(LightningModule):
                     "context_extrinsics": batch["context"]["extrinsics"][b_idx].detach().cpu(),
                 }
                 torch.save(gaussians_data, pt_path)
-                print(f" [SAVE] Saved full 3DGS data to: {pt_path}")
 
         self.log("info/near", batch["context"]["near"].detach().cpu().numpy().mean())
         self.log("info/far", batch["context"]["far"].detach().cpu().numpy().mean())
@@ -918,9 +950,12 @@ class ModelWrapper(LightningModule):
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.optimizer_cfg.lr)
         if self.optimizer_cfg.cosine_lr:
+            # print(f"Cosine annealing LR enabled")
+            
+            # exit()
             warm_up = torch.optim.lr_scheduler.OneCycleLR(
                             optimizer, self.optimizer_cfg.lr,
-                            self.trainer.max_steps + 10,
+                            self.trainer.max_steps ,
                             pct_start=0.01,
                             cycle_momentum=False,
                             anneal_strategy='cos',

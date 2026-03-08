@@ -1,5 +1,5 @@
 defaults:
-  - dataset: re10k
+  - dataset: dfc2019
   - optional dataset/view_sampler_dataset_specific_config: ${dataset/view_sampler}_${dataset}
   - model/encoder: costvolume
   - model/decoder: splatting_cuda
@@ -64,8 +64,8 @@ test:
 seed: 111123
 
 trainer:
-  max_steps: -1
-  val_check_interval: 0.5
+  max_steps: 200000
+  val_check_interval: 1
   check_val_every_n_epoch: 1
   gradient_clip_val: 0.5
   num_sanity_val_steps: 2
