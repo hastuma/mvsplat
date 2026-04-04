@@ -42,8 +42,6 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         image_shape: tuple[int, int],
         depth_mode: DepthRenderingMode | None = None,
     ) -> DecoderOutput:
-        near [0] = 390000  # Hardcoded value for near plane
-        far[0] =400000.0 # Hardcoded value for far plane
         b, v, _, _ = extrinsics.shape
         color = render_cuda(
             rearrange(extrinsics, "b v i j -> (b v) i j"),

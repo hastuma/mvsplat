@@ -1,0 +1,227 @@
+{
+  "location": {
+    "latitude": 24.786944654672414,
+    "longitude": 120.9979260167771
+  },
+  "search_radius": 200,
+  "grid_resolution": 1.0,
+  "max_height": 100,
+  "volume_shape": [
+    459,
+    505,
+    100
+  ],
+  "num_buildings": 25,
+  "num_points_buildings": 1274397,
+  "num_points_ground": 58190,
+  "num_points_total": 1332587,
+  "building_classes": {
+    "residential": 1,
+    "commercial": 2,
+    "industrial": 3,
+    "public": 4,
+    "other": 5
+  },
+  "building_info": [
+    {
+      "instance_id": 1,
+      "semantic_id": 5,
+      "semantic_name": "university",
+      "height": 31.5,
+      "centroid": [
+        40.36363636363637,
+        101.95454545454545
+      ]
+    },
+    {
+      "instance_id": 2,
+      "semantic_id": 5,
+      "semantic_name": "university",
+      "height": 7.0,
+      "centroid": [
+        33.0,
+        43.2
+      ]
+    },
+    {
+      "instance_id": 3,
+      "semantic_id": 5,
+      "semantic_name": "university",
+      "height": 10.5,
+      "centroid": [
+        133.58333333333334,
+        115.66666666666667
+      ]
+    },
+    {
+      "instance_id": 4,
+      "semantic_id": 5,
+      "semantic_name": "university",
+      "height": 14.0,
+      "centroid": [
+        316.12,
+        69.48
+      ]
+    },
+    {
+      "instance_id": 5,
+      "semantic_id": 5,
+      "semantic_name": "university",
+      "height": 7.0,
+      "centroid": [
+        266.2352941176471,
+        37.529411764705884
+      ]
+    },
+    {
+      "instance_id": 6,
+      "semantic_id": 5,
+      "semantic_name": "university",
+      "height": 28.0,
+      "centroid": [
+        194.0625,
+        232.875
+      ]
+    },
+    {
+      "instance_id": 7,
+      "semantic_id": 5,
+      "semantic_name": "university",
+      "height": 31.5,
+      "centroid": [
+        133.93333333333334,
+        226.2
+      ]
+    },
+    {
+      "instance_id": 8,
+      "semantic_id": 5,
+      "semantic_name": "university",
+      "height": 21.0,
+      "centroid": [
+        309.06666666666666,
+        411.4
+      ]
+    },
+    {
+      "instance_id": 9,
+      "semantic_id": 5,
+      "semantic_name": "university",
+      "height": 24.5,
+      "centroid": [
+        52.3,
+        343.9
+      ]
+    },
+    {
+      "instance_id": 10,
+      "semantic_id": 5,
+      "semantic_name": "university",
+      "height": 14.0,
+      "centroid": [
+        469.9,
+        216.95
+      ]
+    },
+    {
+      "instance_id": 11,
+      "semantic_id": 5,
+      "semantic_name": "university",
+      "height": 31.5,
+      "centroid": [
+        299.9166666666667,
+        272.5833333333333
+      ]
+    },
+    {
+      "instance_id": 12,
+      "semantic_id": 5,
+      "semantic_name": "university",
+      "height": 35.0,
+      "centroid": [
+        189.36,
+        348.0
+      ]
+    },
+    {
+      "instance_id": 13,
+      "semantic_id": 5,
+      "semantic_name": "dormitory",
+      "height": 14.0,
+      "centroid": [
+        422.8666666666667,
+        416.8666666666667
+      ]
+    },
+    {
+      "instance_id": 14,
+      "semantic_id": 5,
+      "semantic_name": "university",
+      "height": 24.5,
+      "centroid": [
+        47.0625,
+        250.4375
+      ]
+    },
+    {
+      "instance_id": 15,
+      "semantic_id": 5,
+      "semantic_name": "university",
+      "height": 28.0,
+      "centroid": [
+        27.25,
+        177.91666666666666
+      ]
+    },
+    {
+      "instance_id": 16,
+      "semantic_id": 5,
+      "semantic_name": "university",
+      "height": 10.5,
+      "centroid": [
+        232.8125,
+        133.8125
+      ]
+    },
+    {
+      "instance_id": 17,
+      "semantic_id": 5,
+      "semantic_name": "university",
+      "height": 10.5,
+      "centroid": [
+        333.0,
+        181.71428571428572
+      ]
+    },
+    {
+      "instance_id": 18,
+      "semantic_id": 5,
+      "semantic_name": "university",
+      "height": 7.0,
+      "centroid": [
+        373.2307692307692,
+        137.23076923076923
+      ]
+    },
+    {
+      "instance_id": 19,
+      "semantic_id": 5,
+      "semantic_name": "dormitory",
+      "height": 10.5,
+      "centroid": [
+        397.1304347826087,
+        365.5652173913044
+      ]
+    },
+    {
+      "instance_id": 20,
+      "semantic_id": 5,
+      "semantic_name": "university",
+      "height": 21.0,
+      "centroid": [
+        447.14285714285717,
+        339.2857142857143
+      ]
+    }
+  ]
+}

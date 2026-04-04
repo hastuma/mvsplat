@@ -79,18 +79,18 @@ def warp_with_rpc(
     # 擴展維度
     u_ref = u_ref.unsqueeze(0).unsqueeze(0).expand(b, d, h, w)
     v_ref = v_ref.unsqueeze(0).unsqueeze(0).expand(b, d, h, w)
-    print("\n" + "="*30 + " [RPC WARP CHECK] " + "="*30)
+    # print("\n" + "="*30 + " [RPC WARP CHECK] " + "="*30)
 
     
-    # 檢驗 Ref RPC 參數
-    # Index 0: LINE_OFF (應該有大幅度位移，可能是負數)
-    # Index 4: LAT_OFF (應該是全域值，例如 30.360...)
-    print(f"   LINE_OFF (idx0): {rpc0[0, 0].item():.4f} <--- Check if shifted")
-    print(f"   LAT_OFF  (idx4): {rpc0[0, 4].item():.10f} <--- Check global precision")
+    # # 檢驗 Ref RPC 參數
+    # # Index 0: LINE_OFF (應該有大幅度位移，可能是負數)
+    # # Index 4: LAT_OFF (應該是全域值，例如 30.360...)
+    # print(f"   LINE_OFF (idx0): {rpc0[0, 0].item():.4f} <--- Check if shifted")
+    # print(f"   LAT_OFF  (idx4): {rpc0[0, 4].item():.10f} <--- Check global precision")
     
-    # 檢驗 Height
-    print(f"3. Depth/Height Plane (First 3): {depth[0, :3, 0, 0].flatten().cpu().numpy()}")
-    print(f"3. Depth/Height Plane (last 3): {depth[0, -3:, 0, 0].flatten().cpu().numpy()}")
+    # # 檢驗 Height
+    # print(f"3. Depth/Height Plane (First 3): {depth[0, :3, 0, 0].flatten().cpu().numpy()}")
+    # print(f"3. Depth/Height Plane (last 3): {depth[0, -3:, 0, 0].flatten().cpu().numpy()}")
     # exit()
     # print(f"x_grid sample: {x_grid[0, :5]} | y_grid sample: {y_grid[:5, 0]}")
     # print(f"u_ref sample: {u_ref[0, 0, :5, 0]} | v_ref sample: {v_ref[0, 0, :5, 0]}")
@@ -120,7 +120,7 @@ def warp_with_rpc(
     v_norm = 2 * v_src_feat / (h - 1) - 1
     
     # --- [DEBUG] 投影範圍檢查 ---
-    if True:
+    if False:
         min_u, max_u = u_norm.min().item(), u_norm.max().item()
         print(f"5. Cross-Projection Result (u_norm):")
         print(f"   Range: [{min_u:.4f}, {max_u:.4f}]")
@@ -212,10 +212,10 @@ def prepare_feat_proj_data_lists(
         h_near_plane = h_off + 20 # 最高的平面
         h_far_plane = h_off - 20   # 最低的平面
         
-        print(f"\n[GEOMETRY LOG] prepare_feat_proj_data_lists")
-        print(f"  > Ground Level (approx): {h_off[0,0].item():.1f}m MSL")
-        print(f"  > Search Range (Dist): {near.min().item():.1f}m to {far.max().item():.1f}m")
-        print(f"  > Altitude Range (approx): top={h_near_plane.mean().item():.1f}m, bottom={h_far_plane.mean().item():.1f}m")
+        # print(f"\n[GEOMETRY LOG] prepare_feat_proj_data_lists")
+        # print(f"  > Ground Level (approx): {h_off[0,0].item():.1f}m MSL")
+        # print(f"  > Search Range (Dist): {near.min().item():.1f}m to {far.max().item():.1f}m")
+        # print(f"  > Altitude Range (approx): top={h_near_plane.mean().item():.1f}m, bottom={h_far_plane.mean().item():.1f}m")
 
     depth_candi_curr = repeat(depth_candi_curr, "vb d -> vb d () ()")
     return feat_lists, intr_curr, pose_curr_lists, depth_candi_curr, rpc_curr_lists
@@ -376,6 +376,11 @@ class DepthPredictorMultiView(nn.Module):
         # format the input
         b, v, c, h, w = features.shape
         rpcs = extra_info.get("rpcs", None) if extra_info else None
+        fix_gaussian_position_with_rpc = (
+            extra_info.get("fix_gaussian_position_with_rpc", False)
+            if extra_info
+            else False
+        )
         
         # format the input
         b, v, c, h, w = features.shape
@@ -572,11 +577,16 @@ class DepthPredictorMultiView(nn.Module):
             delta_disps_density = self.to_disparity(refine_out)
             delta_disps, raw_densities = delta_disps_density.split(gaussians_per_pixel, dim=1)
             densities = repeat(F.sigmoid(raw_densities), "(v b) dpt h w -> b v (h w) srf dpt", b=b, v=v, srf=1)
-            # Refine Distance
-            fine_disps = (fullres_disps + delta_disps).clamp(
-                rearrange(distance_near, "b v -> (v b) () () ()"),
-                rearrange(distance_far, "b v -> (v b) () () ()"),
-            )
+            # In RPC mode, optionally freeze Gaussian position to cost-volume depth.
+            # This keeps 3D position fully determined by RPC inverse + fixed pixel center.
+            if rpcs is not None and fix_gaussian_position_with_rpc:
+                fine_disps = fullres_disps
+            else:
+                # Refine Distance
+                fine_disps = (fullres_disps + delta_disps).clamp(
+                    rearrange(distance_near, "b v -> (v b) () () ()"),
+                    rearrange(distance_far, "b v -> (v b) () () ()"),
+                )
             # fine_disps 已經是 Metric Distance (公尺)，直接當作 depth 使用
             depths = fine_disps 
             depths = repeat(depths, "(v b) dpt h w -> b v (h w) srf dpt", b=b, v=v, srf=1)

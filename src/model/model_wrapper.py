@@ -129,36 +129,13 @@ class ModelWrapper(LightningModule):
         # Run the model.
         # Ensure Target Extrinsics match the RPC coordinate system defined by Context
         if "rpc" in batch["context"] and "rpc" in batch["target"]:
-            from ..geometry.rpc import RPC
-            b_ctx, v_ctx, _ = batch["context"]["rpc"].shape
             b_tgt, v_tgt, _ = batch["target"]["rpc"].shape
-            
-            # 計算 context 第一視角圖像中心的真實經緯度作為 ENU 參考點
-            rpc_first = RPC(batch["context"]["rpc"][:, 0, :])  # [B, 90]
-            h_center_ref = batch["context"]["rpc"][:, 0, 8]   # HEIGHT_OFF 作為高度
-            u_center = torch.full_like(h_center_ref, h / 2.0)
-            v_center = torch.full_like(h_center_ref, w / 2.0)
-            lat_ref_origin, lon_ref_origin = rpc_first.inverse(u_center, v_center, h_center_ref)  # [B]
-            
-            # Expand to matches Target (B * V_tgt)
-            lat_ref_flat = lat_ref_origin.repeat_interleave(v_tgt)
-            lon_ref_flat = lon_ref_origin.repeat_interleave(v_tgt)
-            
-            rpc_target_flat = RPC(rearrange(batch["target"]["rpc"], "b v c -> (b v) c"))
-            
+
             target_name = batch["target"]["image_name"]
-            px = batch["target"]["px"]  
-            py = batch["target"]["py"]  
-            
-            # ============================================================
-            # 從 JSON 檔案讀取 SatelliteSfM 相機參數（取代硬編碼）
-            # 數據結構: target_name[v_idx] = [b0_name, b1_name, ...] (tuple)
-            #          px[v_idx] = tensor([px_b0, px_b1, ...])
-            #          py[v_idx] = tensor([py_b0, py_b1, ...])
-            # ============================================================
+            px = batch["target"]["px"]
+            py = batch["target"]["py"]
+
             device = batch["target"]["rpc"].device
-            dtype = torch.float32
-            B = b_tgt  
             K_patches = []
             c2ws = []
             distance_vals = []
@@ -175,48 +152,45 @@ class ModelWrapper(LightningModule):
                     # 構建 JSON 路徑
                     scene_parts = str(img_name).split("_")
                     scene_prefix = "_".join(scene_parts[:2])  # "JAX_004"
-                    camera_json_path = f"/project/winston/datasets/DFC2019/geo_cropped/camera_pose/{scene_prefix}_cameras/{img_name}.json"
+                    camera_json_path = f"/project/winston/datasets/DFC2019/overfit/camera_pose/{scene_prefix}_cameras/{img_name}.json"
                     print(f"reading camera parameters from: {camera_json_path}")
                     with open(camera_json_path, "r") as f:
                         camera_data = json.load(f)
                     
                     # 解析 K（4x4 矩陣展平成 16 元素）和 W2C（4x4）
-                    K_full = torch.tensor(camera_data["K"], device=device, dtype=dtype).reshape(4, 4)
-                    w2c = torch.tensor(camera_data["W2C"], device=device, dtype=dtype).reshape(4, 4)
+                    K_full = torch.tensor(camera_data["K"], device=device, dtype=torch.float64).reshape(4, 4)
+                    w2c = torch.tensor(camera_data["W2C"], device=device, dtype=torch.float64).reshape(4, 4)
                     
                     # 提取 3x3 內參
                     fx = K_full[0, 0]
                     fy = K_full[1, 1]
                     cx_global = K_full[0, 2]
                     cy_global = K_full[1, 2]
+                    # 使用各圖真實裁切起點修正主點（非 Master 的 tile*256 近似值）
+                    col_start_list = batch["target"].get("col_start", None)
+                    row_start_list = batch["target"].get("row_start", None)
+                    if col_start_list is not None and row_start_list is not None:
+                        col_start_val = col_start_list[v_idx][b_idx].item()
+                        row_start_val = row_start_list[v_idx][b_idx].item()
+                    else:
+                        col_start_val = px_val * 256
+                        row_start_val = py_val * 256
+                    cx_patch = cx_global - col_start_val
+                    cy_patch = cy_global - row_start_val
                     
-                    # 計算 patch offset（px, py 各乘以 256）
-                    x_offset = px_val * 256
-                    y_offset = py_val * 256
-                    print(f"x_offset = {x_offset:.2f}, y_offset = {y_offset:.2f}")
-                    print(f"Patch offset for batch {b_idx}: (x_offset={x_offset:.2f}, y_offset={y_offset:.2f})")
-                    # 修正主點：扣除 patch 偏移
-                    cx_patch = cx_global - x_offset
-                    cy_patch = cy_global - y_offset
                     
                     K_patch = torch.tensor([
                         [fx,  0.0, cx_patch],
                         [0.0, fy,  cy_patch],
                         [0.0, 0.0, 1.0     ]
-                    ], device=device, dtype=dtype)
+                    ], device=device, dtype=torch.float64)
                     
                     c2w = torch.inverse(w2c)
-                    distance_val = w2c[2, 3].abs()
-
-                    print(f"K{K_patch}")
-                    print(f"w2c{w2c}")
-                    print(f"c2w{c2w}")
-                    print(f"distance{distance_val}")
-                    # input()
+                    distance_val = c2w[2, 3]  # camera-frame depth of ENU origin (scene depth)
                     K_patches.append(K_patch)
                     c2ws.append(c2w)
                     distance_vals.append(distance_val)
-            
+
             # Stack 成 batch tensor
             K_tgt = torch.stack(K_patches)           # [B*V, 3, 3]
             c2w_tgt = torch.stack(c2ws)              # [B*V, 4, 4]
@@ -229,25 +203,29 @@ class ModelWrapper(LightningModule):
             
         gaussians, vis_dump = self.encoder(batch["context"], self.global_step, False, scene_names=batch["scene"])
         
-        # ============================================================
-        # 投影高斯中心到二維圖像進行驗證（支持 batch_size > 1）
-        # ============================================================
-        if "rpc" in batch["context"] and "rpc" in batch["target"]:
+        
+        GAUSIANS_Correction = False
+        if "rpc" in batch["context"] and "rpc" in batch["target"] and GAUSIANS_Correction:
             gaussian_center_world = gaussians.means.detach().mean(dim=1)  # [B, 3]
             
             # 對每個 batch 投影到對應的目標相機
             for batch_idx in range(b_tgt):
-                
+                print(f"\n[PROJECTION CHECK] Batch {batch_idx}: 投影 Gaussian 中心到目標相機")
+                print(f'batch["target"]["intrinsics"]{batch["target"]["intrinsics"]}')
                 # 獲取該 batch 的第一個目標視角的相機參數
                 K_target = batch["target"]["intrinsics"][batch_idx, 0]  # [3, 3]
                 c2w_target = batch["target"]["extrinsics"][batch_idx, 0]  # [4, 4]
                 w2c_target = torch.inverse(c2w_target)  # [4, 4]
                 
-                # 高斯中心在世界坐標系（齐次坐标）
                 gs_center = gaussian_center_world[batch_idx]  # [3]
-                gs_center_homo = torch.cat([gs_center, torch.ones(1, device=device, dtype=dtype)])  # [4]
+                gs_center_homo = torch.cat([gs_center, torch.ones(1, device=device, dtype=torch.float64)])  # [4]
                 
                 # 轉換到相機坐標系
+                print(f"gs_center: {gs_center}")
+                print(f"gs_center_homo: {gs_center_homo}")
+                print(f"K_target: {K_target}\nK_target.type: {K_target.dtype}")
+                print(f"w2c_target: {w2c_target}\nw2c_target.type: {w2c_target.dtype}")
+                
                 gs_center_cam = torch.matmul(w2c_target, gs_center_homo)  # [4]
                 
                 # 投影到像素坐標
@@ -264,16 +242,8 @@ class ModelWrapper(LightningModule):
                 image_center_v = h / 2.0
                 distance_to_center = torch.sqrt((pixel_u - image_center_u)**2 + (pixel_v - image_center_v)**2)
                 
-                # 打印投影結果
-                # print(f"    世界坐標: [{gs_center[0].item():9.2f}, {gs_center[1].item():9.2f}, {gs_center[2].item():9.2f}]")
-                # print(f"    相機坐標: [{gs_center_cam[0].item():9.2f}, {gs_center_cam[1].item():9.2f}, {gs_center_cam[2].item():9.2f}]")
-                # print(f"    投影像素: ({pixel_u.item():7.2f}, {pixel_v.item():7.2f})")
-                # print(f"    圖像中心: ({image_center_u:7.2f}, {image_center_v:7.2f})")
-                # print(f"    距離中心: {distance_to_center.item():7.2f} 像素")
-                K_target[0,2]+=(128-pixel_u.item())
-                K_target[1,2]+=(128-pixel_v.item())
-                batch["target"]["intrinsics"][batch_idx, 0] = K_target
-                
+                K_target[0,2]+=(128.0-pixel_u.item())
+                K_target[1,2]+=(128.0-pixel_v.item())
             
         # ============================================================
         # [RENDER DEBUG] 詳細輸出相機和 Gaussian 參數
@@ -361,10 +331,7 @@ class ModelWrapper(LightningModule):
             print(f"   ❌ 在相機後面的 Gaussians: {behind_camera.sum().item()}/{len(gs_depths)} ({behind_camera.sum().item()/len(gs_depths)*100:.1f}%)")
             
             print("=" * 70 + "\n")
-            # exit()
-        # ============================================================
-        # [CRITICAL FIX] 動態計算渲染器需要的 near/far
-        # 使用上方已計算的 distance_tgt（來自 Block 1 的 compute_camera_geometry）
+
         # ============================================================
         if "rpc" in batch["context"] and "rpc" in batch["target"]:
             # 直接使用 Block 1 已計算的 distance_tgt，無需重複呼叫 compute_camera_geometry
@@ -438,6 +405,86 @@ class ModelWrapper(LightningModule):
                 f_min, f_max = feat.min(), feat.max()
                 feat = (feat - f_min) / (f_max - f_min + 1e-8)
                 torchvision.utils.save_image(feat, vis_feat_dir / f"step_{self.global_step:0>6}.png")
+
+            # 3.6 Render Context (Training) Views and Save Comparison
+            if "image_name" in batch["context"] and "rpc" in batch["context"]:
+                vis_ctx_dir = self.output_dir / "vis_context"
+                vis_ctx_dir.mkdir(parents=True, exist_ok=True)
+
+                ctx_device = batch["context"]["rpc"].device
+                b_ctx_r, v_ctx_r, _ = batch["context"]["rpc"].shape
+                ctx_name_r = batch["context"]["image_name"]
+                ctx_px_r = batch["context"]["px"]
+                ctx_py_r = batch["context"]["py"]
+
+                K_ctx_list, c2w_ctx_list, dist_ctx_list = [], [], []
+                for b_i in range(b_ctx_r):
+                    for v_i in range(v_ctx_r):
+                        img_name_c = ctx_name_r[v_i][b_i]
+                        px_val_c = ctx_px_r[v_i][b_i].item() if hasattr(ctx_px_r[v_i][b_i], "item") else int(ctx_px_r[v_i][b_i])
+                        py_val_c = ctx_py_r[v_i][b_i].item() if hasattr(ctx_py_r[v_i][b_i], "item") else int(ctx_py_r[v_i][b_i])
+
+                        scene_parts_c = str(img_name_c).split("_")
+                        scene_prefix_c = "_".join(scene_parts_c[:2])
+                        cam_json_c = f"/project/winston/datasets/DFC2019/overfit/camera_pose/{scene_prefix_c}_cameras/{img_name_c}.json"
+                        with open(cam_json_c, "r") as fc:
+                            cam_data_c = json.load(fc)
+
+                        K_full_c = torch.tensor(cam_data_c["K"], device=ctx_device, dtype=torch.float64).reshape(4, 4)
+                        w2c_c = torch.tensor(cam_data_c["W2C"], device=ctx_device, dtype=torch.float64).reshape(4, 4)
+
+
+                        cx_global = K_full_c[0, 2]
+                        cy_global = K_full_c[1, 2]
+                        col_start_list = batch["context"].get("col_start", None)
+                        row_start_list = batch["context"].get("row_start", None)
+                        print("=" * 50 , "context camera parameters before patch offset correction", "=" * 50)
+                        print(f"cx_global: {cx_global}, cy_global: {cy_global}")
+                        if col_start_list is not None and row_start_list is not None:
+                            col_start_val = col_start_list[v_i][b_i].item()
+                            row_start_val = row_start_list[v_i][b_i].item()
+                        cx_patch = cx_global - col_start_val
+                        cy_patch = cy_global - row_start_val
+                        print(f"col_start_val: {col_start_val}")
+                        print(f"row_start_val: {row_start_val}")
+                        print(f"after subtracting crop offsets, cx_patch: { cx_patch}, cy_patch: {cy_patch}")
+                        K_patch_c = torch.tensor([
+                            [K_full_c[0, 0], 0.0,             cx_patch],
+                            [0.0,            K_full_c[1, 1],  cy_patch],
+                            [0.0,            0.0,             1.0 ],
+                        ], device=ctx_device, dtype=torch.float64)
+
+                        K_ctx_list.append(K_patch_c)
+                        c2w_ctx_list.append(torch.inverse(w2c_c))
+                        dist_ctx_list.append(w2c_c[2, 3].abs())
+
+                K_ctx_t = torch.stack(K_ctx_list)
+                c2w_ctx_t = torch.stack(c2w_ctx_list)
+                dist_ctx_t = torch.stack(dist_ctx_list)
+
+                ctx_extr = rearrange(c2w_ctx_t, "(b v) i j -> b v i j", b=b_ctx_r, v=v_ctx_r)
+                ctx_intr = rearrange(K_ctx_t, "(b v) i j -> b v i j", b=b_ctx_r, v=v_ctx_r)
+                dist_ctx = rearrange(dist_ctx_t, "(b v) -> b v", b=b_ctx_r, v=v_ctx_r)
+
+                h_off_ctx = batch["context"]["rpc"][:, :, 8]
+                ctx_near = (h_off_ctx + dist_ctx - (h_off_ctx + 50000.0)).clamp(min=1.0)
+                ctx_far  = (h_off_ctx + dist_ctx - (h_off_ctx - 50000.0)).clamp(min=ctx_near + 1.0)
+
+                with torch.no_grad():
+                    output_ctx = self.decoder.forward(
+                        gaussians,
+                        ctx_extr,
+                        ctx_intr,
+                        ctx_near,
+                        ctx_far,
+                        (h, w),
+                        depth_mode=None,
+                    )
+
+                context_gt = batch["context"]["image"]
+                for vi in range(v_ctx_r):
+                    ctx_compare = torch.cat([context_gt[0, vi], output_ctx.color[0, vi]], dim=-1)
+                    torchvision.utils.save_image(ctx_compare, vis_ctx_dir / f"step_{self.global_step:0>6}_ctx{vi}.png")
 
             # 4. Log Detailed Stats
             with open(self.output_dir / "training_debug.log", "a") as f:
@@ -556,7 +603,6 @@ class ModelWrapper(LightningModule):
         # Tell the data loader processes about the current step.
         if self.step_tracker is not None:
             self.step_tracker.set_step(self.global_step)
-        # exit()
         return total_loss
 
     def test_step(self, batch, batch_idx):
@@ -564,28 +610,82 @@ class ModelWrapper(LightningModule):
         b, v, _, h, w = batch["target"]["image"].shape
         assert b == 1
 
-        # Fix Target Camera (Same as Training)
+        # Fix Target Camera (Same as Training — JSON-based SatelliteSfM camera loading)
+        render_near = batch["target"]["near"]
+        render_far = batch["target"]["far"]
         if "rpc" in batch["context"] and "rpc" in batch["target"]:
-            from ..geometry.rpc import RPC
-            b_ctx, v_ctx, _ = batch["context"]["rpc"].shape
             b_tgt, v_tgt, _ = batch["target"]["rpc"].shape
-            
-            # 計算 context 第一視角圖像中心的真實經緯度作為 ENU 參考點
-            rpc_first = RPC(batch["context"]["rpc"][:, 0, :])  # [B, 90]
-            h_center_ref = batch["context"]["rpc"][:, 0, 8]   # HEIGHT_OFF 作為高度
-            u_center = torch.full_like(h_center_ref, h / 2.0)
-            v_center = torch.full_like(h_center_ref, w / 2.0)
-            lat_ref_origin, lon_ref_origin = rpc_first.inverse(u_center, v_center, h_center_ref)  # [B]
-            
-            lat_ref_flat = lat_ref_origin.repeat_interleave(v_tgt)
-            lon_ref_flat = lon_ref_origin.repeat_interleave(v_tgt)
-            
-            rpc_target_flat = RPC(rearrange(batch["target"]["rpc"], "b v c -> (b v) c"))
-            # 直接使用實際影像尺寸 (h, w)，完全由 RPC 數據驅動（height_scale × GSD_rpc）
-            K_tgt, c2w_tgt, _ = rpc_target_flat.compute_camera_geometry(h, w, lat_ref_flat, lon_ref_flat)
-            
+
+            target_name = batch["target"]["image_name"]
+            px = batch["target"]["px"]
+            py = batch["target"]["py"]
+
+            device = batch["target"]["rpc"].device
+            dataset_root = Path(get_cfg()["dataset"]["roots"][0])
+            K_patches = []
+            c2ws = []
+            distance_vals = []
+
+            for b_idx in range(b_tgt):
+                for v_idx in range(v_tgt):
+                    img_name = target_name[v_idx][b_idx]
+                    px_val = px[v_idx][b_idx].item() if hasattr(px[v_idx][b_idx], "item") else int(px[v_idx][b_idx])
+                    py_val = py[v_idx][b_idx].item() if hasattr(py[v_idx][b_idx], "item") else int(py[v_idx][b_idx])
+
+                    scene_parts = str(img_name).split("_")
+                    scene_prefix = "_".join(scene_parts[:2])  # e.g. "JAX_068"
+                    camera_json_path = dataset_root / "camera_pose" / f"{scene_prefix}_cameras" / f"{img_name}.json"
+                    print(f"reading camera parameters from: {camera_json_path}")
+                    with open(camera_json_path, "r") as f:
+                        camera_data = json.load(f)
+
+                    K_full = torch.tensor(camera_data["K"], device=device, dtype=torch.float64).reshape(4, 4)
+                    w2c = torch.tensor(camera_data["W2C"], device=device, dtype=torch.float64).reshape(4, 4)
+
+                    fx = K_full[0, 0]
+                    fy = K_full[1, 1]
+                    cx_global = K_full[0, 2]
+                    cy_global = K_full[1, 2]
+                    col_start_list = batch["target"].get("col_start", None)
+                    row_start_list = batch["target"].get("row_start", None)
+                    if col_start_list is not None and row_start_list is not None:
+                        col_start_val = col_start_list[v_idx][b_idx].item()
+                        row_start_val = row_start_list[v_idx][b_idx].item()
+                    else:
+                        col_start_val = px_val * 256
+                        row_start_val = py_val * 256
+                    cx_patch = cx_global - col_start_val
+                    cy_patch = cy_global - row_start_val
+
+                    K_patch = torch.tensor([
+                        [fx,  0.0, cx_patch],
+                        [0.0, fy,  cy_patch],
+                        [0.0, 0.0, 1.0     ]
+                    ], device=device, dtype=torch.float64)
+
+                    c2w = torch.inverse(w2c)
+                    distance_val = c2w[2, 3]  # camera-frame depth of ENU origin (scene depth)
+
+                    K_patches.append(K_patch)
+                    c2ws.append(c2w)
+                    distance_vals.append(distance_val)
+
+            K_tgt = torch.stack(K_patches)                    # [B*V, 3, 3]
+            c2w_tgt = torch.stack(c2ws)                       # [B*V, 4, 4]
+            distance_tgt_flat = torch.stack(distance_vals)    # [B*V]
+
             batch["target"]["extrinsics"] = rearrange(c2w_tgt, "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
             batch["target"]["intrinsics"] = rearrange(K_tgt, "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
+            distance_tgt = rearrange(distance_tgt_flat, "(b v) -> b v", b=b_tgt, v=v_tgt)
+
+            # Compute near/far same as training_step
+            h_off_tgt = batch["target"]["rpc"][:, :, 8]   # HEIGHT_OFF [B, V_target]
+            scene_range = 50000.0
+            scene_z_min = h_off_tgt - scene_range
+            scene_z_max = h_off_tgt + scene_range
+            camera_z_tgt = h_off_tgt + distance_tgt
+            render_near = (camera_z_tgt - scene_z_max).clamp(min=1.0)
+            render_far = (camera_z_tgt - scene_z_min).clamp(min=render_near + 1.0)
 
         # Render Gaussians.
         with self.benchmarker.time("encoder"):
@@ -604,8 +704,8 @@ class ModelWrapper(LightningModule):
                 gaussians,
                 batch["target"]["extrinsics"],
                 batch["target"]["intrinsics"],
-                batch["target"]["near"],
-                batch["target"]["far"],
+                render_near,
+                render_far,
                 (h, w),
                 depth_mode=None,
             )
@@ -620,6 +720,63 @@ class ModelWrapper(LightningModule):
         if self.test_cfg.save_image:
             for index, color in zip(batch["target"]["index"][0], images_prob):
                 save_image(color, path / scene / f"color/{index:0>6}.png")
+
+        # Save context (training) images for inspection.
+        if self.test_cfg.save_image and "image_name" in batch["context"] and "rpc" in batch["context"]:
+            ctx_device = batch["context"]["rpc"].device
+            ctx_dataset_root = Path(get_cfg()["dataset"]["roots"][0])
+            v_ctx_t = batch["context"]["rpc"].shape[1]
+            ctx_name_t = batch["context"]["image_name"]
+            ctx_px_t = batch["context"]["px"]
+            ctx_py_t = batch["context"]["py"]
+
+            K_ctx_t_list, c2w_ctx_t_list, dist_ctx_t_list = [], [], []
+            for v_i in range(v_ctx_t):
+                img_name_c = ctx_name_t[v_i][0]
+                px_val_c = ctx_px_t[v_i][0].item() if hasattr(ctx_px_t[v_i][0], "item") else int(ctx_px_t[v_i][0])
+                py_val_c = ctx_py_t[v_i][0].item() if hasattr(ctx_py_t[v_i][0], "item") else int(ctx_py_t[v_i][0])
+
+                scene_parts_c = str(img_name_c).split("_")
+                scene_prefix_c = "_".join(scene_parts_c[:2])
+                cam_json_c = ctx_dataset_root / "camera_pose" / f"{scene_prefix_c}_cameras" / f"{img_name_c}.json"
+                with open(cam_json_c, "r") as fc:
+                    cam_data_c = json.load(fc)
+
+                K_full_c = torch.tensor(cam_data_c["K"], device=ctx_device, dtype=torch.float64).reshape(4, 4)
+                w2c_c = torch.tensor(cam_data_c["W2C"], device=ctx_device, dtype=torch.float64).reshape(4, 4)
+
+                cx_p = K_full_c[0, 2] - px_val_c * 256
+                cy_p = K_full_c[1, 2] - py_val_c * 256
+                K_patch_c = torch.tensor([
+                    [K_full_c[0, 0], 0.0,            cx_p],
+                    [0.0,            K_full_c[1, 1], cy_p],
+                    [0.0,            0.0,            1.0 ],
+                ], device=ctx_device, dtype=torch.float64)
+
+                K_ctx_t_list.append(K_patch_c)
+                c2w_ctx_t_list.append(torch.inverse(w2c_c))
+                dist_ctx_t_list.append(w2c_c[2, 3].abs())
+
+            ctx_extr = rearrange(torch.stack(c2w_ctx_t_list), "v i j -> 1 v i j")
+            ctx_intr = rearrange(torch.stack(K_ctx_t_list),   "v i j -> 1 v i j")
+            dist_ctx = rearrange(torch.stack(dist_ctx_t_list), "v -> 1 v")
+
+            h_off_ctx = batch["context"]["rpc"][:, :, 8]
+            ctx_near = (h_off_ctx + dist_ctx - (h_off_ctx + 50000.0)).clamp(min=1.0)
+            ctx_far  = (h_off_ctx + dist_ctx - (h_off_ctx - 50000.0)).clamp(min=ctx_near + 1.0)
+
+            output_ctx = self.decoder.forward(
+                gaussians,
+                ctx_extr,
+                ctx_intr,
+                ctx_near,
+                ctx_far,
+                (h, w),
+                depth_mode=None,
+            )
+
+            for index, color in zip(batch["context"]["index"][0], output_ctx.color[0]):
+                save_image(color, path / scene / f"context_color/{index:0>6}.png")
 
         # save video
         if self.test_cfg.save_video:
@@ -719,37 +876,6 @@ class ModelWrapper(LightningModule):
             self.log(f"val/lpips_{tag}", lpips)
             ssim = compute_ssim(rgb_gt, rgb).mean()
             self.log(f"val/ssim_{tag}", ssim)
-
-        # # Construct comparison image.
-        # comparison = hcat(
-        #     add_label(vcat(*batch["context"]["image"][0]), "Context"),
-        #     add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
-        #     add_label(vcat(*rgb_softmax), "Target (Softmax)"),
-        # )
-        # self.logger.log_image(
-        #     "comparison",
-        #     [prep_image(add_border(comparison))],
-        #     step=self.global_step,
-        #     caption=batch["scene"],
-        # )
-
-        # # Render projections and construct projection image.
-        # projections = hcat(*render_projections(
-        #                         gaussians_softmax,
-        #                         256,
-        #                         extra_label="(Softmax)",
-        #                     )[0])
-        # self.logger.log_image(
-        #     "projection",
-        #     [prep_image(add_border(projections))],
-        #     step=self.global_step,
-        # )
-
-        # # Draw cameras.
-        # cameras = hcat(*render_cameras(batch, 256))
-        # self.logger.log_image(
-        #     "cameras", [prep_image(add_border(cameras))], step=self.global_step
-        # )
 
         if self.encoder_visualizer is not None:
             for k, image in self.encoder_visualizer.visualize(
@@ -952,7 +1078,7 @@ class ModelWrapper(LightningModule):
         if self.optimizer_cfg.cosine_lr:
             # print(f"Cosine annealing LR enabled")
             
-            # exit()
+
             warm_up = torch.optim.lr_scheduler.OneCycleLR(
                             optimizer, self.optimizer_cfg.lr,
                             self.trainer.max_steps ,

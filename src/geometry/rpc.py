@@ -11,7 +11,14 @@ class RPC:
         if device is None:
             device = coeffs.device
         self.device = device
-        
+
+        # Clone under inference_mode(False) so that all stored attributes are
+        # regular tensors even when the RPC is constructed inside Lightning's
+        # test loop (which runs under torch.inference_mode()).  This is required
+        # because inverse() and get_pinhole_approximation() use torch.autograd.
+        with torch.inference_mode(False):
+            coeffs = coeffs.clone()
+
         # 0-9: Offsets and Scales
         self.line_off = coeffs[..., 0]
         self.line_scale = coeffs[..., 1]
@@ -68,46 +75,61 @@ class RPC:
     def inverse(self, row: Tensor, col: Tensor, height: Tensor, initial_guess: Tuple[Tensor, Tensor] = None, iterations=10) -> Tuple[Tensor, Tensor]:
         spatial_dims = row.ndim - self.line_off.ndim
         s = [1] * spatial_dims
-        
+
         orig_dtype = row.dtype
-        Rn = ((row - self.line_off.view(*self.line_off.shape, *s)) / self.line_scale.view(*self.line_scale.shape, *s)).to(torch.float64)
-        Cn = ((col - self.samp_off.view(*self.samp_off.shape, *s)) / self.samp_scale.view(*self.samp_scale.shape, *s)).to(torch.float64)
-        H = ((height - self.height_off.view(*self.height_off.shape, *s)) / self.height_scale.view(*self.height_scale.shape, *s)).to(torch.float64)
 
-        if initial_guess is None:
-            P = torch.zeros_like(Rn, dtype=torch.float64)
-            L = torch.zeros_like(Cn, dtype=torch.float64)
-        else:
-            lat_g, lon_g = initial_guess
-            P = ((lat_g - self.lat_off.view(*self.lat_off.shape, *s)) / self.lat_scale.view(*self.lat_scale.shape, *s)).to(torch.float64)
-            L = ((lon_g - self.long_off.view(*self.long_off.shape, *s)) / self.long_scale.view(*self.long_scale.shape, *s)).to(torch.float64)
+        # All computation inside inference_mode(False) so that intermediate
+        # tensors derived from potentially-inference input args become regular
+        # tensors that can participate in autograd.
+        with torch.inference_mode(False):
+            row = row.clone()
+            col = col.clone()
+            height = height.clone()
+            print("row" , row)
+            print("col" , col)
+            print("height" , height)
+            Rn = ((row - self.line_off.view(*self.line_off.shape, *s)) / self.line_scale.view(*self.line_scale.shape, *s)).to(torch.float64)
+            Cn = ((col - self.samp_off.view(*self.samp_off.shape, *s)) / self.samp_scale.view(*self.samp_scale.shape, *s)).to(torch.float64)
+            H = ((height - self.height_off.view(*self.height_off.shape, *s)) / self.height_scale.view(*self.height_scale.shape, *s)).to(torch.float64)
+            print("Rn" , Rn)
+            print("Cn" , Cn)
+            print("H" , H)
+            exit()
+            if initial_guess is None:
+                P = torch.zeros_like(Rn, dtype=torch.float64)
+                L = torch.zeros_like(Cn, dtype=torch.float64)
+            else:
+                lat_g, lon_g = initial_guess
+                P = ((lat_g - self.lat_off.view(*self.lat_off.shape, *s)) / self.lat_scale.view(*self.lat_scale.shape, *s)).to(torch.float64)
+                L = ((lon_g - self.long_off.view(*self.long_off.shape, *s)) / self.long_scale.view(*self.long_scale.shape, *s)).to(torch.float64)
 
-        lnc, ldc = self.line_num_coeff.to(torch.float64), self.line_den_coeff.to(torch.float64)
-        snc, sdc = self.samp_num_coeff.to(torch.float64), self.samp_den_coeff.to(torch.float64)
+            lnc, ldc = self.line_num_coeff.to(torch.float64), self.line_den_coeff.to(torch.float64)
+            snc, sdc = self.samp_num_coeff.to(torch.float64), self.samp_den_coeff.to(torch.float64)
 
-        for _ in range(iterations):
-            with torch.enable_grad():
-                P_l = P.detach().requires_grad_(True)
-                L_l = L.detach().requires_grad_(True)
-                
-                r_hat = self._polynomial(P_l, L_l, H, lnc) / self._polynomial(P_l, L_l, H, ldc)
-                c_hat = self._polynomial(P_l, L_l, H, snc) / self._polynomial(P_l, L_l, H, sdc)
-                
-                row_grads = torch.autograd.grad(r_hat.sum(), [P_l, L_l])
-                col_grads = torch.autograd.grad(c_hat.sum(), [P_l, L_l])
-                
-                J = torch.stack([
-                    torch.stack([row_grads[0], row_grads[1]], dim=-1),
-                    torch.stack([col_grads[0], col_grads[1]], dim=-1)
-                ], dim=-2)
-                
-                res = torch.stack([Rn - r_hat.detach(), Cn - c_hat.detach()], dim=-1)
-                dX = torch.linalg.solve(J, res.unsqueeze(-1)).squeeze(-1)
-                P = P + dX[..., 0]
-                L = L + dX[..., 1]
+            for _ in range(iterations):
+                with torch.enable_grad():
+                    P_l = P.clone().detach().requires_grad_(True)
+                    L_l = L.clone().detach().requires_grad_(True)
+                    H_l = H.detach()
 
-        lat = P * self.lat_scale.view(*self.lat_scale.shape, *s).to(torch.float64) + self.lat_off.view(*self.lat_off.shape, *s).to(torch.float64)
-        lon = L * self.long_scale.view(*self.long_scale.shape, *s).to(torch.float64) + self.long_off.view(*self.long_off.shape, *s).to(torch.float64)
+                    r_hat = self._polynomial(P_l, L_l, H_l, lnc) / self._polynomial(P_l, L_l, H_l, ldc)
+                    c_hat = self._polynomial(P_l, L_l, H_l, snc) / self._polynomial(P_l, L_l, H_l, sdc)
+
+                    row_grads = torch.autograd.grad(r_hat.sum(), [P_l, L_l])
+                    col_grads = torch.autograd.grad(c_hat.sum(), [P_l, L_l])
+
+                    J = torch.stack([
+                        torch.stack([row_grads[0], row_grads[1]], dim=-1),
+                        torch.stack([col_grads[0], col_grads[1]], dim=-1)
+                    ], dim=-2)
+
+                    res = torch.stack([Rn - r_hat.detach(), Cn - c_hat.detach()], dim=-1)
+                    dX = torch.linalg.solve(J, res.unsqueeze(-1)).squeeze(-1)
+                    P = P + dX[..., 0]
+                    L = L + dX[..., 1]
+
+            lat = P * self.lat_scale.view(*self.lat_scale.shape, *s).to(torch.float64) + self.lat_off.view(*self.lat_off.shape, *s).to(torch.float64)
+            lon = L * self.long_scale.view(*self.long_scale.shape, *s).to(torch.float64) + self.long_off.view(*self.long_off.shape, *s).to(torch.float64)
         return lat.to(orig_dtype), lon.to(orig_dtype)
 
     def get_pinhole_approximation(self, u: Tensor, v: Tensor, h: Tensor, image_size: Tuple[int, int] = (256, 256)) -> Tuple[Tensor, Tensor]:
@@ -128,112 +150,116 @@ class RPC:
                    - Z 軸：指向場景（從相機看出去的方向）
         """
         img_h, img_w = image_size
-        
-        with torch.no_grad():
-            lat, lon = self.inverse(u, v, h)
-        
-        with torch.enable_grad():
-            r_earth = 6378137.0
-            deg_to_rad = 3.1415926535 / 180.0
-            lat_v = lat.detach().clone().requires_grad_(True)
-            lon_v = lon.detach().clone().requires_grad_(True)
-            h_v = h.detach().clone().requires_grad_(True)
-            row, col = self.forward(lat_v, lon_v, h_v)
-            
-            du_dlat = torch.autograd.grad(row.sum(), lat_v, retain_graph=True)[0]
-            du_dlon = torch.autograd.grad(row.sum(), lon_v, retain_graph=True)[0]
-            dv_dlat = torch.autograd.grad(col.sum(), lat_v, retain_graph=True)[0]
-            dv_dlon = torch.autograd.grad(col.sum(), lon_v, retain_graph=True)[0]
-            
-            cos_lat = torch.cos(lat * deg_to_rad)
-            
-        # Jacobian: d(pixel) / d(geo)
-        J = torch.stack([
-            torch.stack([du_dlon, du_dlat], dim=-1),
-            torch.stack([dv_dlon, dv_dlat], dim=-1)
-        ], dim=-2)
-        J_inv = torch.linalg.inv(J + torch.eye(2, device=self.device).unsqueeze(0) * 1e-12)
-        
-        # === 光線追蹤計算真實 Z 軸 ===
-        # 在同一像素上計算兩個不同高度的 3D 座標，連線得到相機視線方向
-        h_ground = h  # 地面高度
-        h_sky = h + 100.0  # 天空高度（+100m）
-        
-        # 反投影得到兩個 lat/lon
-        with torch.no_grad():
-            lat_ground, lon_ground = self.inverse(u, v, h_ground)
-            lat_sky, lon_sky = self.inverse(u, v, h_sky)
-        
-        # 轉換為 ENU 座標（相對於地面點）
-        x_ground = torch.zeros_like(lat_ground)
-        y_ground = torch.zeros_like(lat_ground)
-        z_ground = torch.zeros_like(lat_ground)
-        
-        x_sky = (lon_sky - lon_ground) * deg_to_rad * r_earth * torch.cos(lat_ground * deg_to_rad)
-        y_sky = (lat_sky - lat_ground) * deg_to_rad * r_earth
-        z_sky = torch.full_like(lat_sky, 100.0)  # 高度差
-        
-        # 視線方向（從地面指向天空）= 相機 Z 軸的負方向
-        ray_dir = torch.stack([x_sky - x_ground, y_sky - y_ground, z_sky - z_ground], dim=-1)
-        ray_dir_normalized = ray_dir / ray_dir.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        
-        # 相機 Z 軸應該指向地面（視線的反方向）
-        cam_z = -ray_dir_normalized
-        
-        # 計算 c_right, c_down（水平分量，用於計算 GSD）
-        dx_du = J_inv[..., 0, 0] * deg_to_rad * r_earth * cos_lat
-        dy_du = J_inv[..., 1, 0] * deg_to_rad * r_earth
-        c_right_horizontal = torch.stack([dx_du, dy_du, torch.zeros_like(dx_du)], dim=-1)
-        
-        dx_dv = J_inv[..., 0, 1] * deg_to_rad * r_earth * cos_lat
-        dy_dv = J_inv[..., 1, 1] * deg_to_rad * r_earth
-        c_down_horizontal = torch.stack([dx_dv, dy_dv, torch.zeros_like(dx_dv)], dim=-1)
-        
-        # 焦距 = 1 / GSD_horizontal（使用水平分量計算）
-        fx = 1.0 / c_right_horizontal.norm(dim=-1).clamp(min=1e-8)
-        fy = 1.0 / c_down_horizontal.norm(dim=-1).clamp(min=1e-8)
-        
-        # 建構相機座標系（camera-to-world）
-        # 相機 X 軸：指向右（投影到垂直於 Z 的平面）
-        c_right_proj = c_right_horizontal - (c_right_horizontal * cam_z).sum(dim=-1, keepdim=True) * cam_z
-        cam_x = c_right_proj / c_right_proj.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        
-        # 相機 Y 軸：cross(Z, X) 確保右手座標系
-        cam_y = torch.cross(cam_z, cam_x, dim=-1)
-        cam_y = cam_y / cam_y.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        
-        # print(f"u {u} \n v {v} \n h {h} \n image_size {image_size}")
-        # print(f"cam_z {cam_z} \n cam_x {cam_x} \n cam_y {cam_y} \n fx {fx} \n fy {fy}")
-        # exit()
 
-        # === DEBUG: 檢查 Z 軸是否有傾角 ===
-        z_vertical = torch.tensor([0.0, 0.0, -1.0], device=cam_z.device)
-        cos_angle = torch.clamp((cam_z * z_vertical).sum(dim=-1), -1, 1)
-        angle_deg = torch.acos(cos_angle) * 180.0 / 3.14159265
-        z_horizontal = torch.sqrt(cam_z[..., 0]**2 + cam_z[..., 1]**2)
+        # Wrap entire method in inference_mode(False) to handle inference tensor inputs.
+        with torch.inference_mode(False):
+            u = u.clone()
+            v = v.clone()
+            h = h.clone()
 
-        # R_c2w: 每一列是相機座標軸在世界座標中的方向
-        R_c2w = torch.stack([cam_x, cam_y, cam_z], dim=-1)
-        
-        # 內參矩陣
-        K = torch.eye(3, device=self.device).repeat(*cam_x.shape[:-1], 1, 1)
-        K[..., 0, 0], K[..., 1, 1] = fx, fy
-        K[..., 0, 2], K[..., 1, 2] = img_w / 2.0, img_h / 2.0
-        
+            with torch.no_grad():
+                lat, lon = self.inverse(u, v, h)
+
+            with torch.enable_grad():
+                r_earth = 6378137.0
+                deg_to_rad = 3.1415926535 / 180.0
+                lat_v = lat.detach().clone().requires_grad_(True)
+                lon_v = lon.detach().clone().requires_grad_(True)
+                h_v = h.detach().clone().requires_grad_(True)
+                row, col = self.forward(lat_v, lon_v, h_v)
+
+                du_dlat = torch.autograd.grad(row.sum(), lat_v, retain_graph=True)[0]
+                du_dlon = torch.autograd.grad(row.sum(), lon_v, retain_graph=True)[0]
+                dv_dlat = torch.autograd.grad(col.sum(), lat_v, retain_graph=True)[0]
+                dv_dlon = torch.autograd.grad(col.sum(), lon_v, retain_graph=True)[0]
+
+                cos_lat = torch.cos(lat * deg_to_rad)
+
+            # Jacobian: d(pixel) / d(geo)
+            J = torch.stack([
+                torch.stack([du_dlon, du_dlat], dim=-1),
+                torch.stack([dv_dlon, dv_dlat], dim=-1)
+            ], dim=-2)
+            J_inv = torch.linalg.inv(J + torch.eye(2, device=self.device).unsqueeze(0) * 1e-12)
+
+            # === 光線追蹤計算真實 Z 軸 ===
+            # 在同一像素上計算兩個不同高度的 3D 座標，連線得到相機視線方向
+            h_ground = h  # 地面高度
+            h_sky = h + 100.0  # 天空高度（+100m）
+
+            # 反投影得到兩個 lat/lon
+            with torch.no_grad():
+                lat_ground, lon_ground = self.inverse(u, v, h_ground)
+                lat_sky, lon_sky = self.inverse(u, v, h_sky)
+
+            # 轉換為 ENU 座標（相對於地面點）
+            x_ground = torch.zeros_like(lat_ground)
+            y_ground = torch.zeros_like(lat_ground)
+            z_ground = torch.zeros_like(lat_ground)
+
+            x_sky = (lon_sky - lon_ground) * deg_to_rad * r_earth * torch.cos(lat_ground * deg_to_rad)
+            y_sky = (lat_sky - lat_ground) * deg_to_rad * r_earth
+            z_sky = torch.full_like(lat_sky, 100.0)  # 高度差
+
+            # 視線方向（從地面指向天空）= 相機 Z 軸的負方向
+            ray_dir = torch.stack([x_sky - x_ground, y_sky - y_ground, z_sky - z_ground], dim=-1)
+            ray_dir_normalized = ray_dir / ray_dir.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+            # 相機 Z 軸應該指向地面（視線的反方向）
+            cam_z = -ray_dir_normalized
+
+            # 計算 c_right, c_down（水平分量，用於計算 GSD）
+            dx_du = J_inv[..., 0, 0] * deg_to_rad * r_earth * cos_lat
+            dy_du = J_inv[..., 1, 0] * deg_to_rad * r_earth
+            c_right_horizontal = torch.stack([dx_du, dy_du, torch.zeros_like(dx_du)], dim=-1)
+
+            dx_dv = J_inv[..., 0, 1] * deg_to_rad * r_earth * cos_lat
+            dy_dv = J_inv[..., 1, 1] * deg_to_rad * r_earth
+            c_down_horizontal = torch.stack([dx_dv, dy_dv, torch.zeros_like(dx_dv)], dim=-1)
+
+            # 焦距 = 1 / GSD_horizontal（使用水平分量計算）
+            fx = 1.0 / c_right_horizontal.norm(dim=-1).clamp(min=1e-8)
+            fy = 1.0 / c_down_horizontal.norm(dim=-1).clamp(min=1e-8)
+
+            # 建構相機座標系（camera-to-world）
+            # 相機 X 軸：指向右（投影到垂直於 Z 的平面）
+            c_right_proj = c_right_horizontal - (c_right_horizontal * cam_z).sum(dim=-1, keepdim=True) * cam_z
+            cam_x = c_right_proj / c_right_proj.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+            # 相機 Y 軸：cross(Z, X) 確保右手座標系
+            cam_y = torch.cross(cam_z, cam_x, dim=-1)
+            cam_y = cam_y / cam_y.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+            # === DEBUG: 檢查 Z 軸是否有傾角 ===
+            z_vertical = torch.tensor([0.0, 0.0, -1.0], device=cam_z.device)
+            cos_angle = torch.clamp((cam_z * z_vertical).sum(dim=-1), -1, 1)
+            angle_deg = torch.acos(cos_angle) * 180.0 / 3.14159265
+            z_horizontal = torch.sqrt(cam_z[..., 0]**2 + cam_z[..., 1]**2)
+
+            # R_c2w: 每一列是相機座標軸在世界座標中的方向
+            R_c2w = torch.stack([cam_x, cam_y, cam_z], dim=-1)
+
+            # 內參矩陣
+            K = torch.eye(3, device=self.device).repeat(*cam_x.shape[:-1], 1, 1)
+            K[..., 0, 0], K[..., 1, 1] = fx, fy
+            K[..., 0, 2], K[..., 1, 2] = img_w / 2.0, img_h / 2.0
+
         return K.to(dtype=torch.float32), R_c2w.to(dtype=torch.float32)
-    def compute_camera_geometry(self, h: int, w: int, lat_ref_global: Tensor = None, lon_ref_global: Tensor = None):
+    def compute_camera_geometry(self, h: int, w: int, lat_ref_global: Tensor = None, lon_ref_global: Tensor = None, h_ref_global: Tensor = None):
         """
         從 RPC 近似針孔相機的內外參數。完全由 RPC 數據驅動，物理單位正確。
-        
+
         Args:
             h, w: 圖像尺寸（像素）
             lat_ref_global, lon_ref_global: ENU 座標系原點的經緯度
-        
+            h_ref_global: ENU 座標系原點的高度（MSL）。提供時，相機 z 為相對於此高度的 ENU Up 分量；
+                          不提供時，相機 z 為絕對 MSL（舊行為，向下相容）。
+
         Returns:
             K: [B, 3, 3] 內參矩陣
             c2w: [B, 4, 4] camera-to-world 外參矩陣（含真實傾角，非強制 Nadir）
             distance: [B] 虛擬相機到場景參考面的高度（米），供 near/far 計算使用
-        
+
         推導方式（物理正確）：
             1. 用 RPC Jacobian 在 HEIGHT_OFF 計算每像素對應地面距離（GSD_rpc）
             2. H = (w/2) × GSD_rpc：讓相機以 ~90° 水平視角覆蓋圖像
@@ -245,59 +271,69 @@ class RPC:
             - ENU 世界座標系：X=東, Y=北, Z=上
             - 相機位於 HEIGHT_OFF + H 高度，Z 軸由光線追踪決定（可能有傾角）
         """
-        device = self.device
-        dtype = self.line_off.dtype
-        B = self.line_off.shape[0]
-        
-        u_center = torch.full((B,), w / 2.0, device=device, dtype=dtype)
-        v_center = torch.full((B,), h / 2.0, device=device, dtype=dtype)
-        h_mean = self.height_off  # RPC 參考高度 (MSL)
-        
-        # Step 1: 從 RPC Jacobian 取得旋轉矩陣 R 及局部尺度
-        # K_jac[..., 0, 0] = 1/GSD_rpc_x (pixels/meter at HEIGHT_OFF)
-        K_jac, R_c2w = self.get_pinhole_approximation(u_center, v_center, h_mean, image_size=(h, w))
-        
-        # Step 2: 從 Jacobian 推導 GSD（米/像素）← 這是 RPC 在參考高度的真實解析度
-        gsd_rpc_x = 1.0 / K_jac[..., 0, 0].clamp(min=1e-6)  # [B], meters per pixel
-        gsd_rpc_y = 1.0 / K_jac[..., 1, 1].clamp(min=1e-6)  # [B], meters per pixel
-        gsd_rpc = (gsd_rpc_x + gsd_rpc_y) * 0.5             # 平均 GSD [B]
-        
-        # Step 3: 虛擬相機高度（物理正確公式）
-        # H = (w/2) × GSD：讓相機剛好以 ~90° 水平視角覆蓋圖像
-        # 單位檢查：像素 × (米/像素) = 米 ✓
-        distance = (w / 2.0) * gsd_rpc  # [B], meters
-        # distance = self.height_scale * 1.5  # [B], meters
-        
-        # Step 4: 焦距（物理正確公式）
-        # f = H / GSD 或直接使用 Jacobian 推導的焦距
-        # 單位檢查：米 / (米/像素) = 像素 ✓
-        focal = distance / gsd_rpc  # [B], pixels; 等價於 w/2
-        
-  
-        
-        # 建立 K
-        K = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
-        K[..., 0, 0] = focal
-        K[..., 1, 1] = focal
-        K[..., 0, 2] = w / 2.0
-        K[..., 1, 2] = h / 2.0
-        
-        # Step 5: 計算相機在 ENU 座標系中的位置
-        with torch.no_grad():
-            lat_c, lon_c = self.inverse(u_center, v_center, h_mean)
-        
-        lat_ref = lat_c  if lat_ref_global is None else lat_ref_global
-        lon_ref = lon_c  if lon_ref_global is None else lon_ref_global
-        r_earth, rad = 6378137.0, 3.1415926535 / 180.0
-        
-        # ENU 座標（相對於 ENU 原點）
-        x_c = (lon_c - lon_ref) * rad * r_earth * torch.cos(lat_ref * rad)  # 東
-        y_c = (lat_c  - lat_ref) * rad * r_earth                             # 北
-        z_c = h_mean + distance                                               # 上（MSL）
-        
-        # 建構 4x4 c2w 矩陣
-        c2w = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
-        c2w[:, :3, :3] = R_c2w
-        c2w[:, :3, 3] = torch.stack([x_c, y_c, z_c.to(dtype)], dim=-1)
-        
+        # Wrap everything in inference_mode(False) to handle inference tensor inputs.
+        with torch.inference_mode(False):
+            if lat_ref_global is not None:
+                lat_ref_global = lat_ref_global.clone()
+            if lon_ref_global is not None:
+                lon_ref_global = lon_ref_global.clone()
+            if h_ref_global is not None:
+                h_ref_global = h_ref_global.clone()
+
+            device = self.device
+            dtype = self.line_off.dtype
+            B = self.line_off.shape[0]
+
+            u_center = torch.full((B,), w / 2.0, device=device, dtype=dtype)
+            v_center = torch.full((B,), h / 2.0, device=device, dtype=dtype)
+            h_mean = self.height_off  # RPC 參考高度 (MSL)
+
+            # Step 1: 從 RPC Jacobian 取得旋轉矩陣 R 及局部尺度
+            # K_jac[..., 0, 0] = 1/GSD_rpc_x (pixels/meter at HEIGHT_OFF)
+            K_jac, R_c2w = self.get_pinhole_approximation(u_center, v_center, h_mean, image_size=(h, w))
+
+            # Step 2: 從 Jacobian 推導 GSD（米/像素）← 這是 RPC 在參考高度的真實解析度
+            gsd_rpc_x = 1.0 / K_jac[..., 0, 0].clamp(min=1e-6)  # [B], meters per pixel
+            gsd_rpc_y = 1.0 / K_jac[..., 1, 1].clamp(min=1e-6)  # [B], meters per pixel
+            gsd_rpc = (gsd_rpc_x + gsd_rpc_y) * 0.5             # 平均 GSD [B]
+
+            # Step 3: 虛擬相機高度（物理正確公式）
+            # H = (w/2) × GSD：讓相機剛好以 ~90° 水平視角覆蓋圖像
+            # 單位檢查：像素 × (米/像素) = 米 ✓
+            distance = (w / 2.0) * gsd_rpc  # [B], meters
+
+            # Step 4: 焦距（物理正確公式）
+            # f = H / GSD 或直接使用 Jacobian 推導的焦距
+            # 單位檢查：米 / (米/像素) = 像素 ✓
+            focal = distance / gsd_rpc  # [B], pixels; 等價於 w/2
+
+            # 建立 K
+            K = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
+            K[..., 0, 0] = focal
+            K[..., 1, 1] = focal
+            K[..., 0, 2] = w / 2.0
+            K[..., 1, 2] = h / 2.0
+
+            # Step 5: 計算相機在 ENU 座標系中的位置
+            with torch.no_grad():
+                lat_c, lon_c = self.inverse(u_center, v_center, h_mean)
+
+            lat_ref = lat_c  if lat_ref_global is None else lat_ref_global
+            lon_ref = lon_c  if lon_ref_global is None else lon_ref_global
+            r_earth, rad = 6378137.0, 3.1415926535 / 180.0
+
+            # ENU 座標（相對於 ENU 原點）
+            x_c = (lon_c - lon_ref) * rad * r_earth * torch.cos(lat_ref * rad)  # 東
+            y_c = (lat_c  - lat_ref) * rad * r_earth                             # 北
+            if h_ref_global is not None:
+                # 相對於 ENU 原點高度的 Up 分量（與 Gaussian 位置計算一致）
+                z_c = (h_mean + distance) - h_ref_global.to(dtype=dtype)
+            else:
+                z_c = h_mean + distance                                           # 上（MSL，舊行為）
+
+            # 建構 4x4 c2w 矩陣
+            c2w = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
+            c2w[:, :3, :3] = R_c2w
+            c2w[:, :3, 3] = torch.stack([x_c, y_c, z_c.to(dtype)], dim=-1)
+
         return K.to(dtype=torch.float32), c2w.to(dtype=torch.float32), distance.to(dtype=torch.float32)

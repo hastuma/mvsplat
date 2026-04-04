@@ -1,0 +1,72 @@
+{
+  "inputs": {
+    "image_1": "original_satellite_image.png",
+    "image_2": "side_view_architecture_map.png"
+  },
+  "task": "Replace the building geometry in image_1 with the 3D architecture from image_2, while preserving only the texture and color information from image_1.",
+  
+  "geometric_source": {
+    "primary": "image_2 (side_view_architecture_map.png) is the ONLY source of building geometry, heights, and 3D structure.",
+    "constraint": "COMPLETELY IGNORE and REMOVE all building structures visible in image_1. The satellite image must only serve as a texture library, not a geometric reference.",
+    "instruction": "The final output must use the exact 3D building volumes, footprints, and heights defined in image_2. Any buildings visible in the satellite image (image_1) must be treated as obsolete and replaced."
+  },
+  
+  "texture_source": {
+    "primary": "image_1 (original_satellite_image.png) provides ONLY surface colors, materials, and textures.",
+    "constraint": "Extract texture information from image_1 without inferring or preserving any 3D structure from it.",
+    "sampling": "Sample colors and patterns from image_1's roof regions, ground surfaces, and vegetation areas to apply onto the corresponding surfaces of the 3D geometry from image_2."
+  },
+  
+  "scene": {
+    "description": "A photorealistic, oblique-view urban scene where the 3D building geometry is exclusively defined by the architecture map (image_2). The textured appearance of roofs, facades, and ground surfaces are intelligently derived from the satellite image (image_1), creating a seamless integration of accurate geometry with realistic textures."
+  },
+  
+  "texture_application": {
+    "roof_texturing": {
+      "method": "Project roof textures from image_1 onto the top horizontal faces of buildings defined in image_2.",
+      "alignment": "Match the 2D footprint positions between both images to correctly map satellite roof textures onto corresponding 3D building tops.",
+      "details": "Preserve realistic roof materials like tiles, metal sheeting, gravel, HVAC units, and solar panels from image_1."
+    },
+    "facade_generation": {
+      "method": "Generate photorealistic building facades (walls) that match the height and shape from image_2.",
+      "style": "Infer facade appearance (windows, materials, colors) based on: (1) building type/height from image_2, (2) overall color palette from image_1.",
+      "constraint": "Do NOT use any facade geometry or building edges visible in image_1. All vertical surfaces must be newly generated based on image_2's 3D structure."
+    },
+    "ground_texturing": {
+      "method": "Apply ground-level textures (roads, sidewalks, grass, trees) from image_1 onto the ground plane around the 3D buildings from image_2.",
+      "constraint": "Remove all transient objects (vehicles, people) and building shadows from image_1 before applying ground textures."
+    }
+  },
+  
+  "critical_rules": {
+    "rule_1": "The 3D structure in the final output must be 100% identical to image_2. No additional buildings from image_1 should appear.",
+    "rule_2": "If a building exists in image_2 but not in image_1, generate appropriate generic textures for it.",
+    "rule_3": "If a building exists in image_1 but not in image_2, it must be completely removed and replaced with ground texture.",
+    "rule_4": "Building count, positions, and heights in the output must exactly match image_2, never image_1."
+  },
+  
+  "environment": {
+    "lighting": "Natural midday sunlight with realistic shadows cast by buildings according to their heights in image_2.",
+    "atmosphere": "Clear, high-visibility aerial conditions with no haze or artistic filters.",
+    "colors": "Natural color palette matching the authentic tones from the satellite image (image_1)."
+  },
+  
+  "visual_style": {
+    "quality": "8K photorealistic aerial photography quality.",
+    "rendering": "High-detail architectural visualization with sharp edges and realistic material appearances.",
+    "tone": "Neutral, objective documentation style matching professional drone/satellite imagery."
+  },
+  
+  "composition": {
+    "camera_angle": "Oblique aerial perspective matching the viewing angle of image_2, clearly showing building heights, roofs, and facades.",
+    "framing": "District-scale view encompassing the full architectural layout with emphasis on 3D depth and textured surfaces.",
+    "alignment": "Perfectly register the 2D spatial positions between both input images for accurate texture-to-geometry mapping."
+  },
+  
+  "output_requirements": {
+    "geometry": "Exact 3D building volumes from image_2 with no geometric additions or modifications.",
+    "appearance": "Photorealistic textures intelligently transferred from image_1 to create a believable, naturally-lit urban scene.",
+    "consistency": "Seamless integration where the viewer cannot distinguish between mapped textures and generated facades.",
+    "cleanliness": "No transient objects (vehicles, pedestrians), no road markings, no temporal artifacts from the satellite image."
+  }
+}

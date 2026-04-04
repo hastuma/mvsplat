@@ -1,3 +1,4 @@
+
 from dataclasses import dataclass
 from typing import Literal, Optional, List
 
@@ -184,25 +185,25 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
         # so that the cost volume matching uses physically correct intrinsics/poses.
         if "rpc" in context:
             rpc_flat = RPC(rearrange(context["rpc"], "b v c -> (b v) c"))
-            
-            # 計算第一視角圖像中心的真實經緯度作為 ENU 參考點
-            # 這比使用 RPC 的 LAT_OFF/LONG_OFF 更準確，因為那只是 RPC 正規化參數
-            rpc_first = RPC(context["rpc"][:, 0, :])  # [B, 90]
-            h_center_ref = context["rpc"][:, 0, 8]   # HEIGHT_OFF 作為高度
-            u_center = torch.full_like(h_center_ref, h / 2.0)
-            v_center = torch.full_like(h_center_ref, w / 2.0)
-            lat_ref_b, lon_ref_b = rpc_first.inverse(u_center, v_center, h_center_ref)  # [B]
 
-            # 存儲用於後續的 Gaussian 位置計算
+            # 使用 enu_origin 作為統一 ENU 參考點
+            # 與 Gaussian 位置計算（lines ~400）和 target 相機 JSON 保持一致
+            rpc_dtype = context["rpc"].dtype
+            enu_origin_ref = context["enu_origin"][:, 0, :]  # [B, 3]: [lat, lon, height]
+            lat_ref_b = enu_origin_ref[:, 0].to(dtype=rpc_dtype)  # [B]
+            lon_ref_b = enu_origin_ref[:, 1].to(dtype=rpc_dtype)  # [B]
+            h_ref_b   = enu_origin_ref[:, 2].to(dtype=rpc_dtype)  # [B]
+
+            # 存儲用於後續的 Gaussian 位置計算（與 lines ~400 保持一致）
             context["_lat_ref"] = lat_ref_b
             context["_lon_ref"] = lon_ref_b
-            
-            # 擴展 lat_ref_b, lon_ref_b 從 [B] 到 [B*V]，以配合 rpc_flat 的批次大小
-            # rpc_flat 已經展平為 (b*v)，所以需要重複每個 batch 中每個 view 的參考點 v 次
-            lat_ref_flat = lat_ref_b.repeat_interleave(v, dim=0)  # [b] -> [b*v]
-            lon_ref_flat = lon_ref_b.repeat_interleave(v, dim=0)  # [b] -> [b*v]
-            
-            K_approx, c2w, distance_flat = rpc_flat.compute_camera_geometry(h, w, lat_ref_flat, lon_ref_flat)
+
+            # 擴展從 [B] 到 [B*V]，以配合 rpc_flat 的批次大小
+            lat_ref_flat = lat_ref_b.repeat_interleave(v, dim=0)  # [b*v]
+            lon_ref_flat = lon_ref_b.repeat_interleave(v, dim=0)  # [b*v]
+            h_ref_flat   = h_ref_b.repeat_interleave(v, dim=0)    # [b*v]
+
+            K_approx, c2w, distance_flat = rpc_flat.compute_camera_geometry(h, w, lat_ref_flat, lon_ref_flat, h_ref_flat)
             distance_bv = rearrange(distance_flat, "(b v) -> b v", b=b, v=v)
             # Update Context: Now depth_predictor will see these correct cameras!
             context["extrinsics"] = rearrange(c2w, "(b v) i j -> b v i j", b=b, v=v)
@@ -248,6 +249,8 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
         extra_info["rpcs"] = context["rpc"]
         extra_info['images'] = rearrange(context["image"], "b v c h w -> (v b) c h w")
         extra_info["scene_names"] = scene_names
+        # Keep Gaussian positions fixed by RPC inverse in RPC mode.
+        extra_info["fix_gaussian_position_with_rpc"] = "rpc" in context
         # 傳遞 per-view 推導相機高度 [B, V]，讓 depth_predictor 做正確的 altitude 轉換
         if "_virtual_camera_distance" in context:
             extra_info["virtual_camera_distance"] = context["_virtual_camera_distance"]
@@ -276,7 +279,11 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             "... (srf c) -> ... srf c",
             srf=self.cfg.num_surfaces,
         )
-        offset_xy = gaussians[..., :2].sigmoid()
+        if "rpc" in context:
+            # Freeze XY at pixel center so RPC inverse solely defines XY position.
+            offset_xy = torch.full_like(gaussians[..., :2], 0.5)
+        else:
+            offset_xy = gaussians[..., :2].sigmoid()
         pixel_size = 1 / torch.tensor((w, h), dtype=torch.float32, device=device)
         xy_ray = xy_ray + (offset_xy - 0.5) * pixel_size
         gpp = self.cfg.gaussians_per_pixel
@@ -302,7 +309,8 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             # ============================================================
             # [DEBUG] 儲存 3 個視角的預測高度圖 (Height Maps)
             # ============================================================
-            if global_step % 10 == 0:
+            SAVE_DEBUG_HEIGHT_MAPS = False
+            if global_step % 10 == 0 and SAVE_DEBUG_HEIGHT_MAPS:
                 import os
                 from PIL import Image
                 import numpy as np
@@ -347,7 +355,6 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
                 except Exception as e:
                     print(f"\n[VISUALIZATION ERROR] Failed to save height maps: {e}")
 
-            if global_step % 10 == 0:
                 print(f"\n[GEOMETRY LOG] Encoder_CostVolume (Output)")
                 print(f"  > Mean Predicted Distance: {dist_all.mean().item():.2f}m")
                 print(f"  > Mean Target Altitude: {h_all.mean().item():.2f}m MSL")
@@ -358,6 +365,35 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             rpc_all = RPC(repeat(context["rpc"], "b v c -> (b v r srf) c", r=r, srf=srf))
             lat_a, lon_a = rpc_all.inverse(u_all, v_all, h_all)
 
+            # ============================================================
+            # [DEBUG PRINT] Context Image Four-Corner RPC Inverse Results
+            # ============================================================
+            if "image_name" in context:
+                image_names = context["image_name"]  # [V] tuple of str
+                # Extract four corners: top-left, top-right, bottom-left, bottom-right
+                corner_h_indices = [0, 0, h - 1, h - 1]
+                corner_w_indices = [0, w - 1, 0, w - 1]
+                corner_names = ["Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right"]
+                
+                # For each context view
+                for v_idx in range(v):
+                    img_name = image_names[v_idx] if len(image_names) > v_idx else "Unknown"
+                    print(f"\n{'='*70}")
+                    print(f"[CONTEXT VIEW {v_idx}] Image Name: {img_name}")
+                    print(f"{'='*70}")
+
+                    for ch, cw, corner_name in zip(corner_h_indices, corner_w_indices, corner_names):
+                        # Compute flat index within h*w grid for this position
+                        pixel_idx = ch * w + cw
+                        global_idx = (v_idx * h * w + pixel_idx) * srf
+                        lat_corner = lat_a[global_idx].item()
+                        lon_corner = lon_a[global_idx].item()
+                        h_corner = h_all[global_idx].item()
+                        
+                        print(f"  {corner_name} (pixel u={cw}, v={ch}):")
+                        print(f"    Lat: {lat_corner:.8f}°, Lon: {lon_corner:.8f}°, Height: {h_corner:.2f}m MSL")
+                    fjowgopq = input ()
+                    print()
      
             # ENU Origin: 從訓練數據中讀取 (同一 scene 的所有 view 共用相同的 enu_origin)
             # context["enu_origin"] shape: [B, V, 3] 其中 [E(lon), N(lat), U(height)]
@@ -441,6 +477,45 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
                 x_a = (lon_a - lon_ref_a) * rad * r_earth * cos_lat_a
                 y_a = (lat_a - lat_ref_a) * rad * r_earth
                 z_a = h_all
+
+            # ============================================================
+            # [DEBUG PRINT] Context Image Four-Corner ENU Coordinates
+            # ============================================================
+            if "image_name" in context:
+                image_names = context["image_name"]  # [V] tuple of str
+                corner_h_indices = [0, 0, h - 1, h - 1]
+                corner_w_indices = [0, w - 1, 0, w - 1]
+                corner_names = ["Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right"]
+                
+                for v_idx in range(v):
+                    img_name = image_names[v_idx] if len(image_names) > v_idx else "Unknown"
+                    print(f"[CONTEXT VIEW {v_idx}] Image: {img_name} - ENU Coordinates")
+                    
+                    # Collect ENU values for four corners
+                    enu_values = []
+                    for ch, cw, corner_name in zip(corner_h_indices, corner_w_indices, corner_names):
+                        pixel_idx = ch * w + cw
+                        global_idx = (v_idx * h * w + pixel_idx) * srf
+                        
+                        x_corner = x_a[global_idx].item()
+                        y_corner = y_a[global_idx].item()
+                        z_corner = z_a[global_idx].item()
+                        
+                        enu_values.append((x_corner, y_corner, z_corner))
+                        print(f"  {corner_name}: E={x_corner:>12.2f}m, N={y_corner:>12.2f}m, U={z_corner:>10.2f}m")
+                    
+                    # Print range
+                    if enu_values:
+                        x_vals = [v[0] for v in enu_values]
+                        y_vals = [v[1] for v in enu_values]
+                        z_vals = [v[2] for v in enu_values]
+                        print(f"  E-range: [{min(x_vals):>12.2f}, {max(x_vals):>12.2f}]m " +
+                              f"(span: {max(x_vals)-min(x_vals):>10.2f}m)")
+                        print(f"  N-range: [{min(y_vals):>12.2f}, {max(y_vals):>12.2f}]m " +
+                              f"(span: {max(y_vals)-min(y_vals):>10.2f}m)")
+                        print(f"  U-range: [{min(z_vals):>10.2f}, {max(z_vals):>10.2f}]m " +
+                              f"(span: {max(z_vals)-min(z_vals):>8.2f}m)")
+                    print()
 
             means = torch.stack([x_a, y_a, z_a], dim=-1)
 

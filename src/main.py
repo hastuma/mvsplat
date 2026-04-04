@@ -42,13 +42,12 @@ from pytorch_lightning.loggers.wandb import WandbLogger
 # 2026-01-31/02-49-20  :2e-3 /batch 3
 # 2026-01-31/02-51-01  :2e-2 /batch 3
 # 2026-01-31/02-54-19  :1e-1 /batch 3
-
-
+# cp /project/winston/datasets/DFC2019/geo_cropped/JAX_068_004_p0403/* /project/winston/datasets/DFC2019/overfit/training/JAX_068_004_p0403/
 # conda activate mvsplat && cd mvsplat 
 # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
 # source /project/winston/miniconda3/bin/activate mvsplat   && CUDA_VISIBLE_DEVICES=1 python -m src.main +experiment=dfc2019
 # PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False,max_split_size_mb:128" CUDA_VISIBLE_DEVICES=0,1 python -m src.main +experiment=dfc2019
-# CUDA_VISIBLE_DEVICES=4 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=1
+# CUDA_VISIBLE_DEVICES=3 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=3
 # CUDA_VISIBLE_DEVICES=8 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=2
 # CUDA_VISIBLE_DEVICES=5 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=3
 # Configure beartype and jaxtyping.

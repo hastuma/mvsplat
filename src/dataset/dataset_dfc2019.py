@@ -91,7 +91,8 @@ class DFC2019Dataset(Dataset):
         # Randomly select context and target
         # For validation, we might want fixed split, but here we do random for training
         if self.stage == 'train':
-            perm = torch.randperm(len(files))
+            # perm = torch.randperm(len(files))
+            perm = torch.arange(len(files))
             context_indices = perm[:num_context]
             target_indices = perm[num_context:num_context+num_target]
         else:
@@ -105,11 +106,20 @@ class DFC2019Dataset(Dataset):
         enu_origin_path = self.enu_origin_dir / f"{scene}.json"
         with open(enu_origin_path, "r") as f:
             enu_data = json.load(f) #[30.357821655028108, -81.70643392476823, -47.180099999999996]
+
+        # 讀取每張圖的真實裁切起點（由 geographic_cropping.py 生成）
+        crop_offsets_path = scene_dir / "crop_offsets.json"
+        if crop_offsets_path.exists():
+            with open(crop_offsets_path, "r") as f:
+                crop_offsets = json.load(f)
+        else:
+            crop_offsets = {}
         
         enu_origin_tensor = torch.tensor(
             [enu_data[0], enu_data[1], enu_data[2]],
-            dtype=torch.float32
-        )
+            dtype=torch.float64
+       )
+        print(f"Loaded ENU origin for scene {scene}: {enu_origin_tensor}")
         # Helper to load
         def load_view(idx):
             fpath = files[idx]
@@ -144,6 +154,7 @@ class DFC2019Dataset(Dataset):
         for idx in target_indices:
             # 這邊的scene_dir 會是像”/project/winston/datasets/DFC2019/geo_cropped/training/JAX_004_012_p0406“
             # 所以讀file時要先讀主圖，也就是JAX_004_012 , 
+            print(f"Processing target view: {files[idx]}")
             img, rpc = load_view(idx.item())
             target_images.append(img)
             target_rpcs.append(rpc)
@@ -175,7 +186,15 @@ class DFC2019Dataset(Dataset):
         
         context_views = []
 
+        # 提取 patch 座標（所有 view 都在同一個 scene_dir，px/py 相同）
+        _folder = os.path.basename(scene_dir)
+        _patch = _folder.split("_")[-1]  # e.g. "p0406"
+        _patch_py = int(_patch[1:3])
+        _patch_px = int(_patch[3:5])
+
         for i in range(num_context):
+            ctx_image_name = os.path.splitext(os.path.basename(files[context_indices[i].item()]))[0]
+            ctx_offsets = crop_offsets.get(ctx_image_name, {})
             context_views.append({
                 "extrinsics": extrinsics[i],
                 "intrinsics": intrinsics[i],
@@ -184,18 +203,27 @@ class DFC2019Dataset(Dataset):
                 "far": far[i],
                 "index": indices[i],
                 "rpc": rpcs[i],
-                "enu_origin": enu_origins[i]
+                "enu_origin": enu_origins[i],
+                "image_name": ctx_image_name,
+                "px": _patch_px,
+                "py": _patch_py,
+                "col_start": ctx_offsets.get("col_start", _patch_px * 256),
+                "row_start": ctx_offsets.get("row_start", _patch_py * 256),
             })
-            
+            print(f"Context view {i}: image_name={ctx_image_name}\ncol_start={ctx_offsets.get('col_start', _patch_px * 256)}, row_start={ctx_offsets.get('row_start', _patch_py * 256)}")
         target_views = []
         for i in range(num_context, V):
             image_name = os.path.splitext(os.path.basename(files[i]))[0]
-
-            # 取得資料夾名稱
-            folder = os.path.basename(os.path.dirname(files[i]))# folder = JAX_004_012_p0406
-            patch = folder.split("_")[-1]   # p0406
+            folder = os.path.basename(os.path.dirname(files[i]))# folder = JAX_004_012_p0406 或 JAX_004_012_p0406_topleft
+            # 提取 patch 字符串，處理可能存在的 _topleft 或 _center 後綴
+            folder_parts = folder.split("_")
+            if folder_parts[-1] in ["topleft", "center"]:
+                patch = folder_parts[-2]
+            else:
+                patch = folder_parts[-1]
             py = int(patch[1:3])  # 04 -> 4
             px = int(patch[3:5])  # 06 -> 6
+            tgt_offsets = crop_offsets.get(image_name, {})
             target_views.append({
                 "extrinsics": extrinsics[i],
                 "intrinsics": intrinsics[i],
@@ -205,11 +233,13 @@ class DFC2019Dataset(Dataset):
                 "index": indices[i],
                 "rpc": rpcs[i],
                 "enu_origin": enu_origins[i],
-                "image_name": image_name , # Add image name for target views
-                "px": px,  # Add pixel x coordinate
-                "py": py   # Add pixel y coordinate
+                "image_name": image_name,
+                "px": px,
+                "py": py,
+                "col_start": tgt_offsets.get("col_start", px * 256),
+                "row_start": tgt_offsets.get("row_start", py * 256),
             })
-            
+
         return {
             "context": {
                 "extrinsics": torch.stack([v["extrinsics"] for v in context_views]),
@@ -220,6 +250,11 @@ class DFC2019Dataset(Dataset):
                 "index": torch.stack([v["index"] for v in context_views]),
                 "rpc": torch.stack([v["rpc"] for v in context_views]),
                 "enu_origin": torch.stack([v["enu_origin"] for v in context_views]),
+                "image_name": [v["image_name"] for v in context_views],
+                "px": [v["px"] for v in context_views],
+                "py": [v["py"] for v in context_views],
+                "col_start": [v["col_start"] for v in context_views],
+                "row_start": [v["row_start"] for v in context_views],
             },
             "target": {
                 "extrinsics": torch.stack([v["extrinsics"] for v in target_views]),
@@ -232,7 +267,9 @@ class DFC2019Dataset(Dataset):
                 "enu_origin": torch.stack([v["enu_origin"] for v in target_views]),
                 "image_name": [v["image_name"] for v in target_views],
                 "px": [v["px"] for v in target_views],
-                "py": [v["py"] for v in target_views]
+                "py": [v["py"] for v in target_views],
+                "col_start": [v["col_start"] for v in target_views],
+                "row_start": [v["row_start"] for v in target_views],
             },
             "scene": scene_dir.name,
         }
