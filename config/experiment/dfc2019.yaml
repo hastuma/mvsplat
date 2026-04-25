@@ -7,10 +7,10 @@ defaults:
   - override /loss: [mse, lpips]
 
 wandb:
-  mode: disabled  # 停用 WandB，改用本地 CSV 記錄
-  project: mvsplat_skysplat_dfc2019
-  entity: null
-  name: dfc2019_rpc_training
+  mode: online  
+  project: skysplat
+  entity: winstonchang9-national-yang-ming-chiao-tung-university
+  name: Skysplat
 
 checkpointing:
   load: checkpoints/gmdepth-scale1-resumeflowthings-scannet-5d9d7964.pth
@@ -39,8 +39,8 @@ data_loader:
     num_workers: 0
 
 optimizer:
-  lr: 2e-4  # 恢復到原始值（5e-4 導致發散）
-  warm_up_steps: 1000  # 適度的 warm-up
+  lr: 2e-4 
+  warm_up_steps: 10000  # 適度的 warm-up
 
 trainer:
   num_sanity_val_steps: 0  # Skip sanity check to save memory
@@ -48,7 +48,7 @@ trainer:
   accumulate_grad_batches: 1  # Disable accumulation for faster overfitting
   val_check_interval: 100  # Validate every 100 steps
   check_val_every_n_epoch: null # Required for step-based validation on small datasets
-  max_steps: 500000 # Explicitly set max_steps for OneCycleLR
+  max_steps: 20000 # Explicitly set max_steps for OneCycleLR
 
 model:
   encoder:
@@ -61,8 +61,12 @@ model:
     wo_cost_volume: false
     gaussians_per_pixel: 1  # Keep at 1
 
-train_cfg:
+train:
   extended_visualization: true
   depth_mode: null
   print_log_every_n_steps: 1
-  save_every_n_steps: 100
+  damv2_encoder: vitl
+  damv2_checkpoint: src/model/encoder/Depth-Anything-V2/checkpoints/depth_anything_v2_vitl.pth
+  damv2_observe_every_n_steps: 10
+  damv2_loss_weight: 0.1        # Pearson loss weight; set to 0.0 to disable
+  damv2_loss_warmup_steps: 500  # steps before DAMV2 loss is added to total

@@ -55,15 +55,25 @@ def export_ply(
     x, y, z, w = rearrange(rotations_final, "g xyzw -> xyzw g")
     rotations_formatted = np.stack((w, x, y, z), axis=-1)
 
-    # 由於我們的軸是為了球諧函數而切換的，我們僅導出 DC 頻帶
-    harmonics_view_invariant = harmonics[..., 0]
+    # Export DC band (f_dc) and all higher-order SH bands (f_rest)
+    # harmonics shape: [N, 3, d_sh] — axis 1 = RGB, axis 2 = SH band index
+    f_dc = harmonics[:, :, 0].detach().cpu().contiguous().numpy()   # [N, 3]
+    d_sh = harmonics.shape[-1]
+    if d_sh > 1:
+        # f_rest order in 3DGS PLY: flatten [N, 3, d_sh-1] → [N, 3*(d_sh-1)]
+        # i.e. [r1, r2, ..., g1, g2, ..., b1, b2, ...]
+        f_rest = harmonics[:, :, 1:].detach().cpu().contiguous().reshape(harmonics.shape[0], -1).numpy()
+    else:
+        f_rest = np.empty((harmonics.shape[0], 0), dtype=np.float32)
 
-    dtype_full = [(attribute, "f4") for attribute in construct_list_of_attributes(0)]
+    num_rest = f_rest.shape[1]
+    dtype_full = [(attribute, "f4") for attribute in construct_list_of_attributes(num_rest)]
     elements = np.empty(means.shape[0], dtype=dtype_full)
     attributes = (
         means.detach().cpu().numpy(),
         torch.zeros_like(means).detach().cpu().numpy(), # nx, ny, nz
-        harmonics_view_invariant.detach().cpu().contiguous().numpy(),
+        f_dc,
+        f_rest,
         opacities[..., None].detach().cpu().numpy(),
         scales.log().detach().cpu().numpy(),
         rotations_formatted,

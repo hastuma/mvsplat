@@ -178,3 +178,4 @@ table.tex
 /test/*
 point_clouds*
 assets/*_3views.json
+src/model/encoder/Depth-Anything-V2/

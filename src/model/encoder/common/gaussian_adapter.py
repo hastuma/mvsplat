@@ -92,15 +92,6 @@ class GaussianAdapter(nn.Module):
         # Force all Gaussians to have scale = 0.1 meters
         # scales = torch.full_like(scales, 0.07)  # All axes = 0.1 meter
 
-        # 讓球全部都白色:
-        # For SH degree 0 (DC component), white = 0.28209 (1/(2*sqrt(pi)))
-        # All higher-degree coefficients = 0
-        # sh_shape = (*opacities.shape, 3, self.d_sh)
-        # sh = torch.zeros(sh_shape, dtype=sh.dtype, device=sh.device)
-        # # Set DC component (index 0) for RGB channels to white
-        # sh[..., :, 0] = 0.28209  # This makes the color white when rendered
-
-
 
 
         # Create world-space covariance matrices.

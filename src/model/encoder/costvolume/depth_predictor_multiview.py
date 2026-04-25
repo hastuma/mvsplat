@@ -534,13 +534,7 @@ class DepthPredictorMultiView(nn.Module):
                 img_array = (norm_map * 255.0).astype(np.uint8)
                 img_path = os.path.join(save_dir, "coarse_altitude.png")
                 Image.fromarray(img_array).save(img_path)
-                
-                print(f"\n[DEBUG] Saved Coarse Altitude Map to {save_dir}")
-                print(f"  > Range: [{alt_min:.2f}m, {alt_max:.2f}m]")
-                # ============================================================
-                # exit()
 
-            # 把cost volume 跟 Ref feature 結合，讓 U-Net 可以同時看到兩者資訊
             raw_correlation_in = torch.cat((raw_correlation_in, feat01), dim=1)
 
         # refine cost volume via 2D u-net

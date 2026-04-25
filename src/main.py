@@ -25,9 +25,7 @@ from pytorch_lightning.loggers.wandb import WandbLogger
 # Set PyTorch memory allocator to reduce fragmentation
 
 
-
 ## inference 
-
 # CUDA_VISIBLE_DEVICES=4 python -m src.main \
 #     +experiment=dfc2019 \
 #     mode=test \
@@ -35,19 +33,7 @@ from pytorch_lightning.loggers.wandb import WandbLogger
 #     model.encoder.visualizer.export_ply=true \
 #     data_loader.test.batch_size=1
 
-
-##traininig 
-# 按照指令順序的lr 
-# 2026-01-30/22-15-37  :2e-4  /batch 3
-# 2026-01-31/02-49-20  :2e-3 /batch 3
-# 2026-01-31/02-51-01  :2e-2 /batch 3
-# 2026-01-31/02-54-19  :1e-1 /batch 3
-# cp /project/winston/datasets/DFC2019/geo_cropped/JAX_068_004_p0403/* /project/winston/datasets/DFC2019/overfit/training/JAX_068_004_p0403/
-# conda activate mvsplat && cd mvsplat 
-# os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
-# source /project/winston/miniconda3/bin/activate mvsplat   && CUDA_VISIBLE_DEVICES=1 python -m src.main +experiment=dfc2019
-# PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False,max_split_size_mb:128" CUDA_VISIBLE_DEVICES=0,1 python -m src.main +experiment=dfc2019
-# CUDA_VISIBLE_DEVICES=3 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=3
+# CUDA_VISIBLE_DEVICES=6 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=3
 # CUDA_VISIBLE_DEVICES=8 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=2
 # CUDA_VISIBLE_DEVICES=5 python -m src.main +experiment=dfc2019 data_loader.train.batch_size=3
 # Configure beartype and jaxtyping.
@@ -193,6 +179,7 @@ def train(cfg_dict: DictConfig):
     if cfg.mode == "train":
         trainer.fit(model_wrapper, datamodule=data_module, ckpt_path=(
             checkpoint_path if cfg.checkpointing.resume else None))
+        trainer.test(model_wrapper, datamodule=data_module)
     else:
         trainer.test(
             model_wrapper,

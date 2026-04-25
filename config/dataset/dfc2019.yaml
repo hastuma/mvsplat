@@ -2,7 +2,7 @@ defaults:
   - view_sampler: bounded
 
 name: dfc2019
-roots: [/project/winston/datasets/DFC2019/overfit/]
+roots: [/project/winston/datasets/DFC2019/overfit_068/]
 make_baseline_1: false
 augment: false
 

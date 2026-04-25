@@ -48,7 +48,7 @@ class DFC2019Dataset(Dataset):
              self.stage_dir = self.root_dir
 
         # Identify all scene directories
-        self.scenes = sorted([d for d in self.stage_dir.iterdir() if d.is_dir()])
+        self.scenes = sorted([self.stage_dir / e.name for e in os.scandir(self.stage_dir) if e.is_dir(follow_symlinks=False)])
         
         if len(self.scenes) == 0:
              print(f"Warning: No scenes found in {self.stage_dir}")
@@ -77,7 +77,7 @@ class DFC2019Dataset(Dataset):
 
     def __getitem__(self, index):
         scene_dir = self.scenes[index]
-        files = sorted(list(scene_dir.glob("*.tif")))#4張會拿前三張當context，最後一張當target
+        files = sorted([scene_dir / e.name for e in os.scandir(scene_dir) if e.name.endswith(".tif") and e.is_file(follow_symlinks=False)])#4張會拿前三張當context，最後一張當target
         if len(files) < 4:
             # Need at least 3 context + 1 target
             return self.__getitem__((index + 1) % len(self))
@@ -119,7 +119,6 @@ class DFC2019Dataset(Dataset):
             [enu_data[0], enu_data[1], enu_data[2]],
             dtype=torch.float64
        )
-        print(f"Loaded ENU origin for scene {scene}: {enu_origin_tensor}")
         # Helper to load
         def load_view(idx):
             fpath = files[idx]
@@ -152,9 +151,6 @@ class DFC2019Dataset(Dataset):
             context_rpcs.append(rpc)
         
         for idx in target_indices:
-            # 這邊的scene_dir 會是像”/project/winston/datasets/DFC2019/geo_cropped/training/JAX_004_012_p0406“
-            # 所以讀file時要先讀主圖，也就是JAX_004_012 , 
-            print(f"Processing target view: {files[idx]}")
             img, rpc = load_view(idx.item())
             target_images.append(img)
             target_rpcs.append(rpc)
@@ -210,7 +206,6 @@ class DFC2019Dataset(Dataset):
                 "col_start": ctx_offsets.get("col_start", _patch_px * 256),
                 "row_start": ctx_offsets.get("row_start", _patch_py * 256),
             })
-            print(f"Context view {i}: image_name={ctx_image_name}\ncol_start={ctx_offsets.get('col_start', _patch_px * 256)}, row_start={ctx_offsets.get('row_start', _patch_py * 256)}")
         target_views = []
         for i in range(num_context, V):
             image_name = os.path.splitext(os.path.basename(files[i]))[0]
@@ -272,4 +267,4 @@ class DFC2019Dataset(Dataset):
                 "row_start": [v["row_start"] for v in target_views],
             },
             "scene": scene_dir.name,
-        }
+        } 

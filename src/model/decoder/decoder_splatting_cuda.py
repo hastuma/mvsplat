@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Optional
 
 import torch
 from einops import rearrange, repeat
@@ -41,8 +41,12 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         far: Float[Tensor, "batch view"],
         image_shape: tuple[int, int],
         depth_mode: DepthRenderingMode | None = None,
+        skew_params: Optional[Float[Tensor, "batch view 4"]] = None,
+        crop_offsets: Optional[Float[Tensor, "batch view 2"]] = None,
     ) -> DecoderOutput:
         b, v, _, _ = extrinsics.shape
+        skew_params_flat  = rearrange(skew_params,  "b v d -> (b v) d") if skew_params  is not None else None
+        crop_offsets_flat = rearrange(crop_offsets, "b v d -> (b v) d") if crop_offsets is not None else None
         color = render_cuda(
             rearrange(extrinsics, "b v i j -> (b v) i j"),
             rearrange(intrinsics, "b v i j -> (b v) i j"),
@@ -54,6 +58,8 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             repeat(gaussians.covariances, "b g i j -> (b v) g i j", v=v),
             repeat(gaussians.harmonics, "b g c d_sh -> (b v) g c d_sh", v=v),
             repeat(gaussians.opacities, "b g -> (b v) g", v=v),
+            skew_params=skew_params_flat,
+            crop_offsets=crop_offsets_flat,
         )
         color = rearrange(color, "(b v) c h w -> b v c h w", b=b, v=v)
 

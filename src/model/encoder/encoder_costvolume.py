@@ -180,69 +180,40 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
         in_feats = trans_features
         gpp = self.cfg.gaussians_per_pixel
         
-        # --- CRITICAL: RPC Camera Pre-computation ---
-        # We must calculate the virtual pinhole cameras BEFORE the depth_predictor
-        # so that the cost volume matching uses physically correct intrinsics/poses.
+        # --- RPC Camera Setup ---
+        # Real JSON cameras are loaded in model_wrapper before encoder is called,
+        # so context["extrinsics"] and context["intrinsics"] are already correct.
+        # Here we only compute distance_bv (camera MSL - h_off) for near/far and
+        # for the altitude plane sweep in depth_predictor.
         if "rpc" in context:
-            rpc_flat = RPC(rearrange(context["rpc"], "b v c -> (b v) c"))
-
-            # 使用 enu_origin 作為統一 ENU 參考點
-            # 與 Gaussian 位置計算（lines ~400）和 target 相機 JSON 保持一致
             rpc_dtype = context["rpc"].dtype
             enu_origin_ref = context["enu_origin"][:, 0, :]  # [B, 3]: [lat, lon, height]
             lat_ref_b = enu_origin_ref[:, 0].to(dtype=rpc_dtype)  # [B]
             lon_ref_b = enu_origin_ref[:, 1].to(dtype=rpc_dtype)  # [B]
-            h_ref_b   = enu_origin_ref[:, 2].to(dtype=rpc_dtype)  # [B]
 
-            # 存儲用於後續的 Gaussian 位置計算（與 lines ~400 保持一致）
+            # Store for Gaussian position computation (used ~line 400)
             context["_lat_ref"] = lat_ref_b
             context["_lon_ref"] = lon_ref_b
 
-            # 擴展從 [B] 到 [B*V]，以配合 rpc_flat 的批次大小
-            lat_ref_flat = lat_ref_b.repeat_interleave(v, dim=0)  # [b*v]
-            lon_ref_flat = lon_ref_b.repeat_interleave(v, dim=0)  # [b*v]
-            h_ref_flat   = h_ref_b.repeat_interleave(v, dim=0)    # [b*v]
-
-            K_approx, c2w, distance_flat = rpc_flat.compute_camera_geometry(h, w, lat_ref_flat, lon_ref_flat, h_ref_flat)
-            distance_bv = rearrange(distance_flat, "(b v) -> b v", b=b, v=v)
-            # Update Context: Now depth_predictor will see these correct cameras!
-            context["extrinsics"] = rearrange(c2w, "(b v) i j -> b v i j", b=b, v=v)
-            context["intrinsics"] = rearrange(K_approx, "(b v) i j -> b v i j", b=b, v=v)
-            
-            # 存儲 per-view distance [B, V] 供後續使用
+            # Compute effective distance = camera MSL altitude - scene HEIGHT_OFF
+            # camera MSL = h_enu_origin + c2w[2,3]
+            # This value is passed to depth_predictor so it can compute:
+            #   cam_msl = h_off + distance_bv = h_off + (h_enu + cam_z - h_off) = h_enu + cam_z  ✓
+            #   altitude_candidate = cam_msl - dist_candidate
+            # 全程用 float32：相機矩陣已是 float32，near/far 不需要 float64 精度
+            h_off = context["rpc"][:, :, 8].to(torch.float32)          # HEIGHT_OFF MSL [B, V]
+            h_enu = enu_origin_ref[:, 2].to(torch.float32)              # ENU origin height MSL [B]
+            cam_z_enu = context["extrinsics"][:, :, 2, 3]               # camera ENU-Z [B, V] float32
+            cam_msl = h_enu.unsqueeze(1) + cam_z_enu                    # camera MSL altitude [B, V]
+            distance_bv = cam_msl - h_off                               # effective distance [B, V]
             context["_virtual_camera_distance"] = distance_bv
 
-            # ============================================================
-            # 動態計算 near/far（相機座標系的深度範圍）
-            # ============================================================
-            # 從 RPC 參數取得高度偏移量 (Height Offset)
-            h_off = context["rpc"][:, :, 8]    # HEIGHT_OFF [B, V]
+            # near/far = distance from camera to altitude planes at h_off ± 20m
+            # near = distance_bv - 20  (distance to highest plane = h_off+20)
+            # far  = distance_bv + 20  (distance to lowest plane  = h_off-20)
             scene_range = 20.0
-            scene_z_min = h_off - scene_range  # 最低海拔 (MSL)
-            scene_z_max = h_off + scene_range  # 最高海拔 (MSL)
-            
-            # 3. 相機高度決定（使用 RPC 推導的 per-view distance [B, V]）
-            distance_bv = context.get("_virtual_camera_distance", None)
-            if distance_bv is None:
-                # fallback: 若無 RPC，使用 h_off 形狀的預設值
-                distance_bv = torch.full_like(h_off, 44.8)
-            camera_z = h_off + distance_bv
-            
-            # 4. Near/Far 定義 (這是"距離" Distance, 而非絕對海拔)
-            # near = 相機到最高海拔平面的垂直距離
-            # far = 相機到最低海拔平面的垂直距離
-            distance_near = (camera_z - scene_z_max).clamp(min=1.0)
-            distance_far = (camera_z - scene_z_min ).clamp(min=distance_near + 1.0)
-            
-            if global_step % 50 == 0:
-                print(f"\n[GEOMETRY CONFIG] Encoder")
-                print(f"  HEIGHT_OFF: {h_off[0,0].item():.1f}m")
-                print(f"  Derived H (from RPC GSD×w/2): {distance_bv[0,0].item():.2f}m  "
-                    f"focal≈{(distance_bv[0,0]/0.35).item():.1f}px")
-                print(f"  Search Range (MSL Alt): [{scene_z_min[0,0].item():.1f}, {scene_z_max[0,0].item():.1f}]")
-                print(f"  Camera Altitude (MSL): {camera_z[0,0].item():.1f}")
-                print(f"  Distance near/far (to Cam): [{distance_near[0,0].item():.1f}, {distance_far[0,0].item():.1f}]")
-            # hjiotehte = input()
+            distance_near = (distance_bv - scene_range).clamp(min=1.0)
+            distance_far  = (distance_bv + scene_range).clamp(min=distance_near + 1.0)
 
         # Prepare extra_info for depth_predictor
         extra_info = {}
@@ -365,49 +336,16 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             rpc_all = RPC(repeat(context["rpc"], "b v c -> (b v r srf) c", r=r, srf=srf))
             lat_a, lon_a = rpc_all.inverse(u_all, v_all, h_all)
 
-            # ============================================================
-            # [DEBUG PRINT] Context Image Four-Corner RPC Inverse Results
-            # ============================================================
-            if "image_name" in context:
-                image_names = context["image_name"]  # [V] tuple of str
-                # Extract four corners: top-left, top-right, bottom-left, bottom-right
-                corner_h_indices = [0, 0, h - 1, h - 1]
-                corner_w_indices = [0, w - 1, 0, w - 1]
-                corner_names = ["Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right"]
-                
-                # For each context view
-                for v_idx in range(v):
-                    img_name = image_names[v_idx] if len(image_names) > v_idx else "Unknown"
-                    print(f"\n{'='*70}")
-                    print(f"[CONTEXT VIEW {v_idx}] Image Name: {img_name}")
-                    print(f"{'='*70}")
-
-                    for ch, cw, corner_name in zip(corner_h_indices, corner_w_indices, corner_names):
-                        # Compute flat index within h*w grid for this position
-                        pixel_idx = ch * w + cw
-                        global_idx = (v_idx * h * w + pixel_idx) * srf
-                        lat_corner = lat_a[global_idx].item()
-                        lon_corner = lon_a[global_idx].item()
-                        h_corner = h_all[global_idx].item()
-                        
-                        print(f"  {corner_name} (pixel u={cw}, v={ch}):")
-                        print(f"    Lat: {lat_corner:.8f}°, Lon: {lon_corner:.8f}°, Height: {h_corner:.2f}m MSL")
-                    fjowgopq = input ()
-                    print()
      
+
             # ENU Origin: 從訓練數據中讀取 (同一 scene 的所有 view 共用相同的 enu_origin)
             # context["enu_origin"] shape: [B, V, 3] 其中 [E(lon), N(lat), U(height)]
             enu_origin_bv = context.get("enu_origin", None)
-            # if enu_origin_bv is not None:
-                # 取第一個視角的 enu_origin (因為同一 scene 内所有視角的参考点相同)
             enu_origin_b = enu_origin_bv[:, 0, :]  # [B, 3]
             lon_ref_b = enu_origin_b[:, 1]  # [B] - East
             lat_ref_b = enu_origin_b[:, 0]  # [B] - North
             h_ref_b = enu_origin_b[:, 2]    # [B] - Up (Height)
             
-            # print(f"[ENU ORIGIN] From Dataset:")
-            # print(f"  Lat: {lat_ref_b[0].item():.8f}, Lon: {lon_ref_b[0].item():.8f}, Height: {h_ref_b[0].item():.2f} m")
-
             lat_ref_a = repeat(lat_ref_b, "b -> (b v r srf)", v=v, r=r, srf=srf)
             lon_ref_a = repeat(lon_ref_b, "b -> (b v r srf)", v=v, r=r, srf=srf)
             h_ref_a = repeat(h_ref_b, "b -> (b v r srf)", v=v, r=r, srf=srf)
@@ -478,44 +416,7 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
                 y_a = (lat_a - lat_ref_a) * rad * r_earth
                 z_a = h_all
 
-            # ============================================================
-            # [DEBUG PRINT] Context Image Four-Corner ENU Coordinates
-            # ============================================================
-            if "image_name" in context:
-                image_names = context["image_name"]  # [V] tuple of str
-                corner_h_indices = [0, 0, h - 1, h - 1]
-                corner_w_indices = [0, w - 1, 0, w - 1]
-                corner_names = ["Top-Left", "Top-Right", "Bottom-Left", "Bottom-Right"]
-                
-                for v_idx in range(v):
-                    img_name = image_names[v_idx] if len(image_names) > v_idx else "Unknown"
-                    print(f"[CONTEXT VIEW {v_idx}] Image: {img_name} - ENU Coordinates")
-                    
-                    # Collect ENU values for four corners
-                    enu_values = []
-                    for ch, cw, corner_name in zip(corner_h_indices, corner_w_indices, corner_names):
-                        pixel_idx = ch * w + cw
-                        global_idx = (v_idx * h * w + pixel_idx) * srf
-                        
-                        x_corner = x_a[global_idx].item()
-                        y_corner = y_a[global_idx].item()
-                        z_corner = z_a[global_idx].item()
-                        
-                        enu_values.append((x_corner, y_corner, z_corner))
-                        print(f"  {corner_name}: E={x_corner:>12.2f}m, N={y_corner:>12.2f}m, U={z_corner:>10.2f}m")
-                    
-                    # Print range
-                    if enu_values:
-                        x_vals = [v[0] for v in enu_values]
-                        y_vals = [v[1] for v in enu_values]
-                        z_vals = [v[2] for v in enu_values]
-                        print(f"  E-range: [{min(x_vals):>12.2f}, {max(x_vals):>12.2f}]m " +
-                              f"(span: {max(x_vals)-min(x_vals):>10.2f}m)")
-                        print(f"  N-range: [{min(y_vals):>12.2f}, {max(y_vals):>12.2f}]m " +
-                              f"(span: {max(y_vals)-min(y_vals):>10.2f}m)")
-                        print(f"  U-range: [{min(z_vals):>10.2f}, {max(z_vals):>10.2f}]m " +
-                              f"(span: {max(z_vals)-min(z_vals):>8.2f}m)")
-                    print()
+
 
             means = torch.stack([x_a, y_a, z_a], dim=-1)
 
@@ -544,63 +445,7 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
             # 覆蓋 means 為 RPC 計算的 ENU 座標
             gaussians.means = rearrange(means, "(b v r srf) xyz -> b v r srf () xyz", b=b, v=v, r=r, srf=srf).float()
             
-            # ============================================================
-            # [DEBUG] 將中間 25% 面積的 Gaussians 染成紅色 (驗證中心投影)
-            # ============================================================
-            DEBUG_SCALE = False #scaling all of the gaussians to be greater,since camera is really far away 
-            if DEBUG_SCALE:
-                scale_factor = 1000.0
-                gaussians.scales *= scale_factor
-            DEBUG_CENTER_COLOR = False
-            if DEBUG_CENTER_COLOR:
-                # 取得所有 Gaussians 的 X, Y 座標
-                means_flat = gaussians.means.view(-1, 3)
-                x_coords, y_coords = means_flat[:, 0], means_flat[:, 1]
-                
-                # 計算範圍
-                x_min, x_max = x_coords.min(), x_coords.max()
-                y_min, y_max = y_coords.min(), y_coords.max()
-                x_range, y_range = x_max - x_min, y_max - y_min
-                
-                # 中間 25% 面積意味著 X, Y 各取中間 50% (0.5 * 0.5 = 0.25)
-                # 也就是兩邊各留 25% 的邊際
-                margin = 0.1
-                is_center = (
-                    (x_coords > x_min + x_range * margin) & 
-                    (x_coords < x_max - x_range * margin) &
-                    (y_coords > y_min + y_range * margin) &
-                    (y_coords < y_max - y_range * margin)
-                )
-                
-                # 修改 SH (只保留 0 階，且設為紅色)
-                original_shape = gaussians.harmonics.shape
-                harmonics_flat = gaussians.harmonics.view(-1, 3, original_shape[-1])
-                
-                # 設定所有 Gaussians 的高階 SH 均為 0 (只留 0 階 DC)
-                if original_shape[-1] > 1:
-                    harmonics_flat[:, :, 1:] = 0.0
-                
-                # 將中心區域設為純紅
-                harmonics_flat[is_center, 0, 0] = 1.0  # R = 1
-                harmonics_flat[is_center, 1, 0] = 0.0  # G = 0
-                harmonics_flat[is_center, 2, 0] = 0.0  # B = 0
-                
-                gaussians.harmonics = harmonics_flat.view(original_shape)
-                
-                # 增加中心區域的 Opacity 確保看得到
-                opacity_flat = gaussians.opacities.view(-1)
-                opacity_flat[is_center] = 1.0
-                gaussians.opacities = opacity_flat.view_as(gaussians.opacities)
-                
-                if global_step % 10 == 0:
-                    center_count = is_center.sum().item()
-                    total_count = is_center.numel()
-                    print(f"\n🎯 [CENTER DEBUG] Step {global_step}")
-                    print(f"   中心 Gaussians (紅): {center_count}/{total_count} ({center_count/total_count*100:.1f}%)")
-                    print(f"   X Center Range: [{x_min + x_range*margin:.2f}, {x_max - x_range*margin:.2f}]")
-                    print(f"   Y Center Range: [{y_min + y_range*margin:.2f}, {y_max - y_range*margin:.2f}]")
-            
-            
+
         else:
             # Original Pinhole branch (Unchanged)
             gaussians = self.gaussian_adapter.forward(
@@ -648,59 +493,7 @@ class EncoderCostVolume(Encoder[EncoderCostVolumeCfg]):
         # --- Position (Means) 統計 ---
         
         means = gaussians_obj.means.detach()
-        PRINT_GS=   False
-        if PRINT_GS:
-            print(f"\n[POSITION / MEANS]")
-            print(f"  Shape: {means.shape}")
-            print(f"  X: min={means[..., 0].min().item():.4f}, max={means[..., 0].max().item():.4f}, mean={means[..., 0].mean().item():.4f}, std={means[..., 0].std().item():.4f}")
-            print(f"  Y: min={means[..., 1].min().item():.4f}, max={means[..., 1].max().item():.4f}, mean={means[..., 1].mean().item():.4f}, std={means[..., 1].std().item():.4f}")
-            print(f"  Z: min={means[..., 2].min().item():.4f}, max={means[..., 2].max().item():.4f}, mean={means[..., 2].mean().item():.4f}, std={means[..., 2].std().item():.4f}")
-            
-            # --- Scale 統計 ---
-            scales = gaussians_obj.scales.detach()
-            print(f"\n[SCALES]")
-            print(f"  Shape: {scales.shape}")
-            print(f"  Overall: min={scales.min().item():.6f}, max={scales.max().item():.6f}, mean={scales.mean().item():.6f}, std={scales.std().item():.6f}")
-            print(f"  Scale X: min={scales[..., 0].min().item():.6f}, max={scales[..., 0].max().item():.6f}, mean={scales[..., 0].mean().item():.6f}")
-            print(f"  Scale Y: min={scales[..., 1].min().item():.6f}, max={scales[..., 1].max().item():.6f}, mean={scales[..., 1].mean().item():.6f}")
-            print(f"  Scale Z: min={scales[..., 2].min().item():.6f}, max={scales[..., 2].max().item():.6f}, mean={scales[..., 2].mean().item():.6f}")
-            
-            # --- Opacity 統計 ---
-            opacities = gaussians_obj.opacities.detach()
-            print(f"\n[OPACITIES]")
-            print(f"  Shape: {opacities.shape}")
-            print(f"  min={opacities.min().item():.6f}, max={opacities.max().item():.6f}, mean={opacities.mean().item():.6f}, std={opacities.std().item():.6f}")
-            # 計算透明度分佈
-            low_opacity = (opacities < 0.1).sum().item()
-            mid_opacity = ((opacities >= 0.1) & (opacities < 0.5)).sum().item()
-            high_opacity = (opacities >= 0.5).sum().item()
-            print(f"  Distribution: <0.1: {low_opacity:,} ({100*low_opacity/opacities.numel():.1f}%), 0.1~0.5: {mid_opacity:,} ({100*mid_opacity/opacities.numel():.1f}%), >=0.5: {high_opacity:,} ({100*high_opacity/opacities.numel():.1f}%)")
-            
-            # --- Color (Spherical Harmonics) 統計 ---
-            harmonics = gaussians_obj.harmonics.detach()
-            print(f"\n[COLORS / SPHERICAL HARMONICS]")
-            print(f"  Shape: {harmonics.shape}")
-            # DC component (index 0) 代表基本顏色
-            dc_component = harmonics[..., 0]  # [B, N, 3]
-            print(f"  DC Component (Base Color):")
-            print(f"    R: min={dc_component[..., 0].min().item():.4f}, max={dc_component[..., 0].max().item():.4f}, mean={dc_component[..., 0].mean().item():.4f}")
-            print(f"    G: min={dc_component[..., 1].min().item():.4f}, max={dc_component[..., 1].max().item():.4f}, mean={dc_component[..., 1].mean().item():.4f}")
-            print(f"    B: min={dc_component[..., 2].min().item():.4f}, max={dc_component[..., 2].max().item():.4f}, mean={dc_component[..., 2].mean().item():.4f}")
-            
-            # --- Rotation 統計 ---
-            rotations = gaussians_obj.rotations.detach()
-            print(f"\n[ROTATIONS (Quaternion)]")
-            print(f"  Shape: {rotations.shape}")
-            print(f"  Norm: min={rotations.norm(dim=-1).min().item():.6f}, max={rotations.norm(dim=-1).max().item():.6f}, mean={rotations.norm(dim=-1).mean().item():.6f}")
-            
-            # --- Covariance 統計 ---
-            covariances = gaussians_obj.covariances.detach()
-            print(f"\n[COVARIANCES]")
-            print(f"  Shape: {covariances.shape}")
-            print(f"  Overall: min={covariances.min().item():.6f}, max={covariances.max().item():.6f}, mean={covariances.mean().item():.6f}")
-            
-            print(f"\n{'='*60}\n")
-        
+       
         return gaussians_obj, visualization_dump
 
     def get_data_shim(self) -> DataShim:

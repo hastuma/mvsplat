@@ -12,8 +12,8 @@ from torch import Tensor
 
 from ...geometry.projection import get_fov, homogenize_points
 from ..encoder.costvolume.conversions import depth_to_relative_disparity
-
-
+import torch.nn.functional as F
+import torchvision
 def get_projection_matrix(
     near: Float[Tensor, " batch"],
     far: Float[Tensor, " batch"],
@@ -43,7 +43,6 @@ def get_projection_matrix(
     result[:, 2, 3] = -(far * near) / (far - near)
     return result
 def get_projection_matrix_asymmetric(K, near, far, W, H):
-    # fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
     fx = K[..., 0, 0]
     fy = K[..., 1, 1]
     cx = K[..., 0, 2]
@@ -72,6 +71,8 @@ def render_cuda(
     gaussian_opacities: Float[Tensor, "batch gaussian"],
     scale_invariant: bool = True,
     use_sh: bool = True,
+    skew_params: Float[Tensor, "batch 4"] | None = None,
+    crop_offsets: Float[Tensor, "batch 2"] | None = None,
 ) -> Float[Tensor, "batch 3 height width"]:
     assert use_sh or gaussian_sh_coefficients.shape[-1] == 1
 
@@ -83,10 +84,10 @@ def render_cuda(
     far = far.float()
     background_color = background_color.float()
     gaussian_means = gaussian_means.float()
+    
     gaussian_covariances = gaussian_covariances.float()
     gaussian_sh_coefficients = gaussian_sh_coefficients.float()
     gaussian_opacities = gaussian_opacities.float()
-
     # Make sure everything is in a range where numerical issues don't appear.
     if scale_invariant:
         scale = 1 / near
@@ -102,23 +103,23 @@ def render_cuda(
     shs = rearrange(gaussian_sh_coefficients, "b g xyz n -> b g n xyz").contiguous()
 
     b, _, _ = extrinsics.shape
-    h, w = image_shape
-
-    fov_x, fov_y = get_fov(intrinsics,h).unbind(dim=-1)
+    # When crop_offsets is provided: render full 2048×2048, then unwarp + crop.
+    # Otherwise: render directly at the requested output size.
+    h_out, w_out = image_shape
+    
+    if crop_offsets is not None:
+        h_render, w_render = 2048, 2048
+    else:
+        h_render, w_render = h_out, w_out
+    fov_x, fov_y = get_fov(intrinsics, h_render).unbind(dim=-1)
     tan_fov_x = (0.5 * fov_x).tan()
     tan_fov_y = (0.5 * fov_y).tan()
-    # grewg = input(f"fov x= {fov_x} \nfov y , {fov_y}\ntan_fov_x : {tan_fov_x} \ntan_fov_y : {tan_fov_y}\n in render_cuda, press Enter to continue...")
-
-    # projection_matrix = get_projection_matrix(near, far, fov_x, fov_y)
-    projection_matrix=get_projection_matrix_asymmetric(intrinsics, near, far, w, h)
+    projection_matrix = get_projection_matrix_asymmetric(intrinsics, near, far, w_render, h_render)
     projection_matrix = rearrange(projection_matrix, "b i j -> b j i")
     view_matrix = rearrange(extrinsics.inverse(), "b i j -> b j i")
     full_projection = view_matrix @ projection_matrix
-
     all_images = []
-    all_radii = []
     for i in range(b):
-        # Set up a tensor for the gradients of the screen-space means.
         mean_gradients = torch.zeros_like(gaussian_means[i], requires_grad=True)
         try:
             mean_gradients.retain_grad()
@@ -126,8 +127,8 @@ def render_cuda(
             pass
 
         settings = GaussianRasterizationSettings(
-            image_height=h,
-            image_width=w,
+            image_height=h_render,
+            image_width=w_render,
             tanfovx=tan_fov_x[i].item(),
             tanfovy=tan_fov_y[i].item(),
             bg=background_color[i],
@@ -136,14 +137,13 @@ def render_cuda(
             projmatrix=full_projection[i],
             sh_degree=degree,
             campos=extrinsics[i, :3, 3],
-            prefiltered=False,  # This matches the original usage.
+            prefiltered=False,
             debug=False,
         )
         rasterizer = GaussianRasterizer(settings)
 
         row, col = torch.triu_indices(3, 3)
-
-        image, radii = rasterizer(
+        image, _ = rasterizer(
             means3D=gaussian_means[i].float(),
             means2D=mean_gradients.float(),
             shs=shs[i].float() if use_sh else None,
@@ -151,8 +151,48 @@ def render_cuda(
             opacities=gaussian_opacities[i, ..., None].float(),
             cov3D_precomp=gaussian_covariances[i, :, row, col].float(),
         )
+        # Apply inverse skew warp: rendered (s=0) → original satellite geometry (s≠0)
+        if skew_params is not None:
+            s_i    = skew_params[i, 0].item()
+            fy_i   = skew_params[i, 1].item()
+            cy_i   = skew_params[i, 2].item()
+            dcx_i  = skew_params[i, 3].item()
+            v_c = torch.arange(h_render, dtype=torch.float32, device=image.device)
+            u_c = torch.arange(w_render, dtype=torch.float32, device=image.device)
+            vv, uu = torch.meshgrid(v_c, u_c, indexing='ij')
+            u_sample = uu + dcx_i - (s_i / fy_i) * (vv - cy_i)
+            v_sample = vv
+            u_norm = (u_sample / (w_render - 1)) * 2.0 - 1.0
+            v_norm = (v_sample / (h_render - 1)) * 2.0 - 1.0
+            grid = torch.stack([u_norm, v_norm], dim=-1).unsqueeze(0)
+            image = F.grid_sample(
+                image.unsqueeze(0), grid,
+                mode='bilinear', padding_mode='zeros', align_corners=True,
+            ).squeeze(0)
+
+        # Crop to output size
+        if crop_offsets is not None:
+            col_s = int(crop_offsets[i, 0].item())
+            row_s = int(crop_offsets[i, 1].item())
+            # Keep output size fixed even when offsets fall outside render bounds.
+            # This mirrors dataset-side padding behavior used during patch generation.
+            x1, y1 = col_s, row_s
+            x2, y2 = col_s + w_out, row_s + h_out
+
+            read_x1, read_y1 = max(0, x1), max(0, y1)
+            read_x2, read_y2 = min(w_render, x2), min(h_render, y2)
+
+            read_w = read_x2 - read_x1
+            read_h = read_y2 - read_y1
+
+            cropped = image.new_zeros((image.shape[0], h_out, w_out))
+            if read_w > 0 and read_h > 0:
+                out_x1 = read_x1 - x1
+                out_y1 = read_y1 - y1
+                cropped[:, out_y1 : out_y1 + read_h, out_x1 : out_x1 + read_w] = \
+                    image[:, read_y1:read_y2, read_x1:read_x2]
+            image = cropped
         all_images.append(image)
-        all_radii.append(radii)
     return torch.stack(all_images)
 
 
