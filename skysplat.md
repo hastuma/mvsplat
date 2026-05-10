@@ -88,7 +88,27 @@ The target camera parameters (extrinsics) are computed in the same ENU frame, en
   - **$L_\text{RGB}$**: Photometric reconstruction loss (MSE + LPIPS) between rendered and target images.
   - **$L_\text{Smooth}$**: Regularization on $\Delta \text{Pos}$ to prevent geometry collapse.
   - **$L_\text{Opacity}$**: Penalty when mean opacity falls below 0.3, preventing Gaussians from collapsing to transparent.
-  - **$L_\text{DAMV2}$**: Pearson correlation loss between cost-volume depth and frozen Depth Anything V2 (DAMv2) relative depth. DAMv2 acts as a monocular depth teacher (weights frozen); only the encoder depth receives gradients. Loss = $-\bar{\rho}(\text{cv\_depth},\ \text{damv2\_depth})$ averaged over all context views. Controlled by `damv2_loss_weight` (default 0.1) and `damv2_loss_warmup_steps` (default 500) in the experiment config.
+  - **$L_\text{DAMV2}$**: Pearson correlation loss between cost-volume depth and frozen Depth Anything V2 (DAMv2) relative depth. DAMv2 acts as a monocular depth teacher (weights frozen); only the encoder depth receives gradients. Controlled by `damv2_loss_weight` (default 0.1) and `damv2_loss_warmup_steps` (default 500) in the experiment config.
+
+    **Computation details:**
+
+    For each context view $v$, the loss is:
+    $$L_\text{DAMV2} = -\frac{1}{V} \sum_{v=1}^{V} \rho\!\left(\text{cv\_depth}_v,\ -\text{DAMv2}(\text{img}_v)\right)$$
+
+    where $\rho$ is the Pearson correlation coefficient:
+    $$\rho(X, Y) = \frac{\sum (x_i - \bar x)(y_i - \bar y)}{\sqrt{\sum(x_i-\bar x)^2} \cdot \sqrt{\sum(y_i-\bar y)^2} + \varepsilon}$$
+
+    **Sign convention (critical):** DAMv2 was trained on ground-perspective images. When applied to top-down satellite images, it assigns *larger* relative-depth values to buildings (interpreting complex building-roof textures as "distant" background). The cost-volume depth, however, assigns *smaller* metric distances to buildings (buildings are physically closer to the satellite). Therefore DAMv2's output is **negated** before computing Pearson, so both signals point in the same direction (small = building = close to satellite).
+
+    **Interpreting `loss/damv2_pearson` on WandB:**
+
+    | Value | $\rho$ | Meaning |
+    |---|---|---|
+    | **−0.7 to −0.9** | +0.7–+0.9 | ✅ **Ideal** — strong positive correlation; depth structure matches DAMv2 |
+    | **≈ 0** | ≈ 0 | ❌ **Failure** — depth std → 0 (flat plane collapse); Pearson undefined → returns 0 |
+    | **> 0** | negative | ❌ Sign convention wrong; negate DAMv2 output |
+
+    The loss being very negative (e.g. −0.9) is the **goal**, not a problem. A sudden jump from −0.9 to ≈ 0 indicates depth has collapsed to a flat plane (zero variance → Pearson numerically → 0), NOT that training stabilised.
 
 ---
 
@@ -127,7 +147,7 @@ WandB logs:
 |-----|-------|-------------|
 | `loss/mse` | train | Photometric MSE between rendered and GT target |
 | `loss/lpips` | train | LPIPS perceptual loss |
-| `loss/damv2_pearson` | train | DAMV2 Pearson correlation loss (`-ρ`); negative when cost-volume depth aligns with DAMV2 |
+| `loss/damv2_pearson` | train | DAMV2 Pearson correlation loss (`-ρ(cv_depth, -damv2)`); **−0.7~−0.9 = ideal** (strong correct correlation); ≈0 = flat-depth collapse (not convergence) |
 | `loss/total` | train | Sum of all active losses + opacity regularisation |
 | `depth/pearson_view{v}` | train | Per-context-view Pearson correlation (observation only, no gradient) |
 | `depth/pearson_avg` | train | Mean Pearson across all context views (observation only) |

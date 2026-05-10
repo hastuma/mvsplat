@@ -130,7 +130,7 @@ def _damv2_observe(
         ctx_v = ctx_imgs[:, v]          # [B, 3, H, W]  values in [0,1]
         cv_depth_v = depth_hires[:, v]  # [B, H, W]  cost-volume depth (metres)
 
-        damv2_depth_v = damv2(ctx_v.to(device))   # [B, H, W]  relative depth
+        damv2_depth_v = -damv2(ctx_v.to(device))   # [B, H, W]  negated: satellite near=small, DAMV2 assigns large to buildings → flip
 
         corr_v = _pearson_corr(cv_depth_v, damv2_depth_v)   # [B]
         corrs_per_view.append(corr_v)
@@ -204,7 +204,7 @@ def _damv2_pearson_loss(
     B, V, _, _, _ = ctx_imgs.shape
     corrs = []
     for v in range(V):
-        damv2_v = damv2(ctx_imgs[:, v])              # [B, H, W]  detached
+        damv2_v = -damv2(ctx_imgs[:, v])             # [B, H, W]  negated: same sign fix as _damv2_observe
         corrs.append(_pearson_corr(cv_depth_map[:, v], damv2_v))  # [B]
     return -torch.stack(corrs).mean()  # minimize = maximize pearson
 

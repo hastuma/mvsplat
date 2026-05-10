@@ -2,9 +2,15 @@ defaults:
   - view_sampler: bounded
 
 name: dfc2019
-roots: [/project/winston/datasets/DFC2019/overfit_068/]
+roots: [/project/winston/mvsplat/datasets/DFC2019/overfit/]
 make_baseline_1: false
 augment: false
+
+# Online random crop (train only).
+# Set raw_scenes_dir to the directory containing full-resolution TIF images.
+# Leave empty ("") to use the pre-cropped patches in roots[0] (original behaviour).
+raw_scenes_dir: /project/winston/mvsplat/datasets/DFC2019/Track3-RGB-1
+online_crops_per_scene: 500
 
 image_shape: [128, 128]
 background_color: [0.0, 0.0, 0.0]

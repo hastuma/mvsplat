@@ -22,10 +22,11 @@ dataset:
   view_sampler:
     name: bounded
     num_context_views: 3
-    num_target_views: 1 # Reconstruction/Novel view is implied by target=context usually or similar
-  image_shape: [256, 256]  # Restored to SkySplat training patch size
-  # roots 會從 config/dataset/dfc2019.yaml 繼承，不要在這裡重複定義
-  # Additional RPC specific params if needed
+    num_target_views: 1
+  image_shape: [256, 256]
+  # Overfit to a single scene (online crop mode).
+  # Change to null to train on all scenes in raw_scenes_dir.
+  overfit_to_scene: JAX_004
 
 data_loader:
   train:
@@ -39,16 +40,16 @@ data_loader:
     num_workers: 0
 
 optimizer:
-  lr: 2e-4 
-  warm_up_steps: 10000  # 適度的 warm-up
+  lr: 2e-4
+  warm_up_steps: 2000  # 縮短 warm-up：避免 step~6800 時 LR 仍在上升觸發深度崩潰
 
 trainer:
   num_sanity_val_steps: 0  # Skip sanity check to save memory
-  gradient_clip_val: 0.5  # 降低到 0.5 防止梯度爆炸（原本 1.0）
+  gradient_clip_val: 0.3  # 從 0.5 降到 0.3，進一步防止大梯度更新觸發崩潰
   accumulate_grad_batches: 1  # Disable accumulation for faster overfitting
   val_check_interval: 100  # Validate every 100 steps
   check_val_every_n_epoch: null # Required for step-based validation on small datasets
-  max_steps: 20000 # Explicitly set max_steps for OneCycleLR
+  max_steps: 100000 # Explicitly set max_steps for OneCycleLR
 
 model:
   encoder:
@@ -68,5 +69,5 @@ train:
   damv2_encoder: vitl
   damv2_checkpoint: src/model/encoder/Depth-Anything-V2/checkpoints/depth_anything_v2_vitl.pth
   damv2_observe_every_n_steps: 10
-  damv2_loss_weight: 0.1        # Pearson loss weight; set to 0.0 to disable
+  damv2_loss_weight: 10000.0       # Pearson loss weight; set to 0.0 to disable
   damv2_loss_warmup_steps: 500  # steps before DAMV2 loss is added to total
