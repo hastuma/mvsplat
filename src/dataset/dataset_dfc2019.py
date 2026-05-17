@@ -306,8 +306,8 @@ class DFC2019Dataset(Dataset):
         scene_id = self.scene_ids[index % len(self.scene_ids)]
         images = self.scene_groups[scene_id]
 
-        # Random 4-image selection: 1 master + 3 slaves
-        perm = random.sample(range(len(images)), min(4, len(images)))
+        # 3-image selection: 1 master + 2 slaves (context-only training)
+        perm = random.sample(range(len(images)), min(3, len(images)))
         selected = [images[i] for i in perm]
         master_path = selected[0]
 
@@ -397,8 +397,7 @@ class DFC2019Dataset(Dataset):
 
         # ---- Assemble output ----
         num_context = 3
-        num_target = 1
-        V = num_context + num_target
+        V = num_context
 
         images_t = torch.stack(view_images)      # [V, 3, H, W]
         rpcs_t   = torch.stack(view_rpcs)        # [V, 90]
@@ -435,7 +434,6 @@ class DFC2019Dataset(Dataset):
             return views
 
         ctx_views = _make_views(0, num_context)
-        tgt_views = _make_views(num_context, num_target)
 
         def _stack(views, key):
             return torch.stack([v[key] for v in views])
@@ -459,21 +457,6 @@ class DFC2019Dataset(Dataset):
                 "col_start":   _list(ctx_views, "col_start"),
                 "row_start":   _list(ctx_views, "row_start"),
             },
-            "target": {
-                "extrinsics":  _stack(tgt_views, "extrinsics"),
-                "intrinsics":  _stack(tgt_views, "intrinsics"),
-                "image":       _stack(tgt_views, "image"),
-                "near":        _stack(tgt_views, "near"),
-                "far":         _stack(tgt_views, "far"),
-                "index":       _stack(tgt_views, "index"),
-                "rpc":         _stack(tgt_views, "rpc"),
-                "enu_origin":  _stack(tgt_views, "enu_origin"),
-                "image_name":  _list(tgt_views, "image_name"),
-                "px":          _list(tgt_views, "px"),
-                "py":          _list(tgt_views, "py"),
-                "col_start":   _list(tgt_views, "col_start"),
-                "row_start":   _list(tgt_views, "row_start"),
-            },
             "scene": scene_id,
         }
 
@@ -488,16 +471,17 @@ class DFC2019Dataset(Dataset):
             for e in os.scandir(scene_dir)
             if e.name.endswith(".tif") and e.is_file(follow_symlinks=False)
         ])
-        if len(files) < 4:
-            return self._getitem_precropped((index + 1) % len(self.scenes))
-
         num_context = 3
-        num_target = 1
+        # Train: 3 context only; Val/Test: 3 context + 1 target
+        num_target = 0 if self.stage == "train" else 1
+        min_files = num_context + num_target
+        if len(files) < min_files:
+            return self._getitem_precropped((index + 1) % len(self.scenes))
 
         if self.stage == "train":
             perm = torch.arange(len(files))
             context_indices = perm[:num_context]
-            target_indices  = perm[num_context:num_context + num_target]
+            target_indices  = perm[num_context:num_context]  # empty
         else:
             context_indices = torch.arange(num_context)
             target_indices  = torch.arange(num_context, num_context + num_target)
@@ -615,7 +599,7 @@ class DFC2019Dataset(Dataset):
         def _list(views, key):
             return [v[key] for v in views]
 
-        return {
+        out = {
             "context": {
                 "extrinsics":  _stack(context_views, "extrinsics"),
                 "intrinsics":  _stack(context_views, "intrinsics"),
@@ -631,7 +615,10 @@ class DFC2019Dataset(Dataset):
                 "col_start":   _list(context_views, "col_start"),
                 "row_start":   _list(context_views, "row_start"),
             },
-            "target": {
+            "scene": scene_dir.name,
+        }
+        if num_target > 0:
+            out["target"] = {
                 "extrinsics":  _stack(target_views, "extrinsics"),
                 "intrinsics":  _stack(target_views, "intrinsics"),
                 "image":       _stack(target_views, "image"),
@@ -645,6 +632,5 @@ class DFC2019Dataset(Dataset):
                 "py":          _list(target_views, "py"),
                 "col_start":   _list(target_views, "col_start"),
                 "row_start":   _list(target_views, "row_start"),
-            },
-            "scene": scene_dir.name,
-        }
+            }
+        return out

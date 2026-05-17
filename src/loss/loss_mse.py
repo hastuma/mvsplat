@@ -27,5 +27,5 @@ class LossMse(Loss[LossMseCfg, LossMseCfgWrapper]):
         gaussians: Gaussians,
         global_step: int,
     ) -> Float[Tensor, ""]:
-        delta = prediction.color - batch["target"]["image"]
+        delta = prediction.color - batch["context"]["image"]
         return self.cfg.weight * (delta**2).mean()

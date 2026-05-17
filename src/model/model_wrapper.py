@@ -124,7 +124,14 @@ def _damv2_observe(
     depth_hires = depth_hires.reshape(B, V, H, W)                # [B, V, H, W]
 
     corrs_per_view = []
-    vis_rows = []  # for saving a comparison image
+    cv_depth_cells = []   # for the top row of the 2×V grid (cost-volume depths)
+    da_depth_cells = []   # for the bottom row (DAMV2 depths)
+
+    save_vis = (global_step % 200 == 0)
+
+    def _norm_to_01(t):
+        mn, mx = t.min(), t.max()
+        return ((t - mn) / (mx - mn + 1e-8)).unsqueeze(0).expand(3, -1, -1)
 
     for v in range(V):
         ctx_v = ctx_imgs[:, v]          # [B, 3, H, W]  values in [0,1]
@@ -144,19 +151,9 @@ def _damv2_observe(
         except Exception:
             pass
 
-        # Build one row of the visualization grid: [ctx_rgb | cv_depth | da_depth]
-        if B > 0:
-            def _norm_to_01(t):
-                t = t[0].cpu()   # [H, W]
-                mn, mx = t.min(), t.max()
-                return ((t - mn) / (mx - mn + 1e-8)).unsqueeze(0).expand(3, -1, -1)
-
-            row = torch.cat([
-                ctx_v[0].cpu(),           # RGB image
-                _norm_to_01(cv_depth_v),  # cost-volume depth (greyscale as RGB)
-                _norm_to_01(damv2_depth_v),  # DAMV2 depth
-            ], dim=-1)   # [3, H, 3W]
-            vis_rows.append(row)
+        if save_vis and B > 0:
+            cv_depth_cells.append(_norm_to_01(cv_depth_v[0].cpu()))
+            da_depth_cells.append(_norm_to_01(damv2_depth_v[0].cpu()))
 
     # Average Pearson across all views
     corrs_all = torch.stack(corrs_per_view, dim=0)   # [V, B]
@@ -173,16 +170,20 @@ def _damv2_observe(
         f"avg={pearson_avg:.3f}"
     )
 
-    # Save side-by-side visualization: one image per context view
-    # Each image: [RGB | cv_depth | da_depth] horizontally concatenated
-    if vis_rows:
+    # Save a single 2×V grid every 200 steps:
+    #   Row 0: cost-volume depths for each context view
+    #   Row 1: DAMV2 depths for each context view
+    if save_vis and cv_depth_cells:
+        top_row    = torch.cat(cv_depth_cells, dim=-1)   # [3, H, V*W]
+        bottom_row = torch.cat(da_depth_cells, dim=-1)   # [3, H, V*W]
+        grid = torch.cat([top_row, bottom_row], dim=-2)  # [3, 2H, V*W]
+
         vis_damv2_dir = output_dir / "vis_damv2"
         vis_damv2_dir.mkdir(parents=True, exist_ok=True)
-        for vi, row in enumerate(vis_rows):
-            torchvision.utils.save_image(
-                row,
-                vis_damv2_dir / f"step_{global_step:0>6}_ctx{vi}.png",
-            )
+        torchvision.utils.save_image(
+            grid,
+            vis_damv2_dir / f"step_{global_step:0>6}.png",
+        )
 
 
 def _damv2_pearson_loss(
@@ -411,191 +412,78 @@ class ModelWrapper(LightningModule):
 
     def training_step(self, batch, batch_idx):
         batch: BatchedExample = self.data_shim(batch)
-        _, _, _, h, w = batch["target"]["image"].shape
+        _, _, _, h, w = batch["context"]["image"].shape
 
-        # Run the model.
-        # Ensure Target Extrinsics match the RPC coordinate system defined by Context
-        if "rpc" in batch["context"] and "rpc" in batch["target"]:
-            b_tgt, v_tgt, _ = batch["target"]["rpc"].shape
-            device = batch["target"]["rpc"].device
-
-            # Load full-image K_s0 (no crop adjustment) + skew params + crop offsets
-            c2w_tgt, K_tgt, skew_params_tgt, crop_offsets_tgt, distance_tgt_flat = \
-                self._load_target_cameras_full(batch["target"], device)
-
-            batch["target"]["extrinsics"]   = rearrange(c2w_tgt,          "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
-            batch["target"]["intrinsics"]   = rearrange(K_tgt,            "(b v) i j -> b v i j", b=b_tgt, v=v_tgt)
-            batch["target"]["skew_params"]  = rearrange(skew_params_tgt,  "(b v) d   -> b v d",   b=b_tgt, v=v_tgt)
-            batch["target"]["crop_offsets"] = rearrange(crop_offsets_tgt, "(b v) d   -> b v d",   b=b_tgt, v=v_tgt)
-            distance_tgt = rearrange(distance_tgt_flat, "(b v) -> b v", b=b_tgt, v=v_tgt)
-
-            # Load crop-adjusted K_s0 for context views (encoder uses 256×256 patches)
+        # Load crop-adjusted K_s0 for context views (encoder uses 256×256 patches)
+        if "rpc" in batch["context"]:
             b_ctx, v_ctx, _ = batch["context"]["rpc"].shape
-            # c2w_ctx, K_ctx, skew_params_ctx, crop_offsets_ctx, _ = self._load_json_cameras(batch["context"], device)
-            c2w_ctx, K_ctx, skew_params_ctx, crop_offsets_ctx, _ = self._load_target_cameras_full(batch["context"], device)
-            batch["context"]["extrinsics"] = rearrange(c2w_ctx, "(b v) i j -> b v i j", b=b_ctx, v=v_ctx)
-            batch["context"]["intrinsics"] = rearrange(K_ctx,   "(b v) i j -> b v i j", b=b_ctx, v=v_ctx)
+            device = batch["context"]["rpc"].device
+            c2w_ctx, K_ctx, skew_params_ctx, crop_offsets_ctx, distance_ctx_flat = \
+                self._load_target_cameras_full(batch["context"], device)
+            batch["context"]["extrinsics"]   = rearrange(c2w_ctx, "(b v) i j -> b v i j", b=b_ctx, v=v_ctx)
+            batch["context"]["intrinsics"]   = rearrange(K_ctx,   "(b v) i j -> b v i j", b=b_ctx, v=v_ctx)
             batch["context"]["skew_params"]  = rearrange(skew_params_ctx,  "(b v) d   -> b v d",   b=b_ctx, v=v_ctx)
             batch["context"]["crop_offsets"] = rearrange(crop_offsets_ctx, "(b v) d   -> b v d",   b=b_ctx, v=v_ctx)
+            dist_ctx = rearrange(distance_ctx_flat, "(b v) -> b v", b=b_ctx, v=v_ctx)
 
         gaussians, vis_dump = self.encoder(batch["context"], self.global_step, False, scene_names=batch["scene"])
 
-        if "rpc" in batch["context"] and "rpc" in batch["target"]:
-            # camera MSL = h_enu_origin + c2w[2,3]
-            # near/far = distance from camera to altitude planes at h_off ± 20m
-            h_off_tgt = batch["target"]["rpc"][:, :, 8].to(torch.float32)  # HEIGHT_OFF [B, V]
-            h_enu_tgt = batch["target"]["enu_origin"][:, 0, 2].to(
-                device=h_off_tgt.device, dtype=torch.float32)               # ENU origin MSL [B]
-            cam_msl_tgt = h_enu_tgt.unsqueeze(1) + distance_tgt.to(torch.float32)  # [B, V]
-            dist_eff_tgt = cam_msl_tgt - h_off_tgt                         # effective distance [B, V]
-            scene_range = 20.0
-            render_near = (dist_eff_tgt - scene_range).clamp(min=1.0)
-            render_far  = (dist_eff_tgt + scene_range).clamp(min=render_near + 1.0)
+        # Wide ±50000m sweep around dist_ctx (satellite-scale; mirrors vis_context formula)
+        if "rpc" in batch["context"]:
+            render_near = (dist_ctx - 50000.0).clamp(min=1.0)
+            render_far  = (dist_ctx + 50000.0).clamp(min=render_near + 1.0)
         else:
-            render_near = batch["target"]["near"]
-            render_far = batch["target"]["far"]
+            render_near = batch["context"]["near"]
+            render_far  = batch["context"]["far"]
         output = self.decoder.forward(
             gaussians,
-            batch["target"]["extrinsics"],
-            batch["target"]["intrinsics"],
+            batch["context"]["extrinsics"],
+            batch["context"]["intrinsics"],
             render_near,
             render_far,
             (h, w),
             depth_mode=self.train_cfg.depth_mode,
-            skew_params=batch["target"].get("skew_params"),
-            crop_offsets=batch["target"].get("crop_offsets"),
+            skew_params=batch["context"].get("skew_params"),
+            crop_offsets=batch["context"].get("crop_offsets"),
         )
-        target_gt = batch["target"]["image"]
+        target_gt = batch["context"]["image"]
 
-        # --- DEBUG: Save Rendered Image, Depth Maps and Log Stats ---
+        # --- DEBUG: Save Rendered Image and Log Stats ---
         if self.global_rank == 0 and self.global_step % 10 == 0:
             import torchvision
-            from pathlib import Path
-            import torch.nn.functional as F
-            
-            # 1. Setup Directories
+
             vis_loss_dir = self.output_dir / "vis_loss"
-            vis_depth_dir = self.output_dir / "vis_depth"
-            vis_feat_dir = self.output_dir / "vis_feature"
             vis_loss_dir.mkdir(parents=True, exist_ok=True)
-            vis_depth_dir.mkdir(parents=True, exist_ok=True)
-            vis_feat_dir.mkdir(parents=True, exist_ok=True)
 
-            # Render Context (Training) Views and Save Comparison (every 100 steps)
-            if self.global_step % 100 == 0 and "image_name" in batch["context"] and "rpc" in batch["context"]:
-                vis_ctx_dir = self.output_dir / "vis_context"
-                vis_ctx_dir.mkdir(parents=True, exist_ok=True)
-
-                ctx_device = batch["context"]["rpc"].device
-                b_ctx_r, v_ctx_r, _ = batch["context"]["rpc"].shape
-                ctx_name_r = batch["context"]["image_name"]
-                ctx_px_r = batch["context"]["px"]
-                ctx_py_r = batch["context"]["py"]
-
-                K_ctx_list, c2w_ctx_list, dist_ctx_list = [], [], []
-                for b_i in range(b_ctx_r):
-                    for v_i in range(v_ctx_r):
-                        img_name_c = ctx_name_r[v_i][b_i]
-                        scene_parts_c = str(img_name_c).split("_")
-                        scene_prefix_c = "_".join(scene_parts_c[:2])
-                        cam_json_c = Path(get_cfg()["dataset"]["roots"][0]) / "camera_pose" / f"{scene_prefix_c}_cameras" / f"{img_name_c}.json"
-                        with open(cam_json_c, "r") as fc:
-                            cam_data_c = json.load(fc)
-
-                        K_full_c = torch.tensor(cam_data_c["K"], device=ctx_device, dtype=torch.float64).reshape(4, 4)
-                        w2c_c = torch.tensor(cam_data_c["W2C"], device=ctx_device, dtype=torch.float64).reshape(4, 4)
-
-                        cx_global = K_full_c[0, 2]
-                        cy_global = K_full_c[1, 2]
-                        K_patch_c = torch.tensor([
-                            [K_full_c[0, 0], 0.0,             cx_global],
-                            [0.0,            K_full_c[1, 1],  cy_global],
-                            [0.0,            0.0,             1.0 ],
-                        ], device=ctx_device, dtype=torch.float64)
-                        
-                        K_ctx_list.append(K_patch_c)
-                        c2w_ctx_list.append(torch.inverse(w2c_c))
-                        dist_ctx_list.append(w2c_c[2, 3].abs())
-
-                K_ctx_t = torch.stack(K_ctx_list)
-                c2w_ctx_t = torch.stack(c2w_ctx_list)
-                dist_ctx_t = torch.stack(dist_ctx_list)
-
-                ctx_extr = rearrange(c2w_ctx_t, "(b v) i j -> b v i j", b=b_ctx_r, v=v_ctx_r)
-                ctx_intr = rearrange(K_ctx_t, "(b v) i j -> b v i j", b=b_ctx_r, v=v_ctx_r)
-                dist_ctx = rearrange(dist_ctx_t, "(b v) -> b v", b=b_ctx_r, v=v_ctx_r)
-
-                h_off_ctx = batch["context"]["rpc"][:, :, 8]
-                ctx_near = (h_off_ctx + dist_ctx - (h_off_ctx + 50000.0)).clamp(min=1.0)
-                ctx_far  = (h_off_ctx + dist_ctx - (h_off_ctx - 50000.0)).clamp(min=ctx_near + 1.0)
-
-                with torch.no_grad():
-                    output_ctx = self.decoder.forward(
-                        gaussians,
-                        ctx_extr,
-                        ctx_intr,
-                        ctx_near,
-                        ctx_far,
-                        (h, w),
-                        depth_mode=None,
-                        # there should be the following skew_param and crop_offsets to send in this function too 
-                        skew_params=batch["context"].get("skew_params"),
-                        crop_offsets=batch["context"].get("crop_offsets"),
-                    )
-
-                context_gt = batch["context"]["image"]
-                for vi in range(v_ctx_r):
-                    ctx_compare = torch.cat([context_gt[0, vi], output_ctx.color[0, vi]], dim=-1)
-                    torchvision.utils.save_image(ctx_compare, vis_ctx_dir / f"step_{self.global_step:0>6}_ctx{vi}.png")
-            # 2. Save RGB comparison
-            img_loss = torch.cat([target_gt[0, 0], output.color[0, 0]], dim=-1)
-            
-            
+            # Save RGB comparison (all context views: GT | render, stacked vertically)
+            v_save = target_gt.shape[1]
+            rows = [torch.cat([target_gt[0, vi], output.color[0, vi]], dim=-1) for vi in range(v_save)]
+            img_loss = torch.cat(rows, dim=-2)
             torchvision.utils.save_image(img_loss, vis_loss_dir / f"step_{self.global_step:0>6}.png")
-            
-            # 3. Save Predict Height Maps (Concatenate Low-res and High-res)
-            # Both are [Batch*View, 1, H, W]. Take the first view of the first batch.
-            d_low = vis_dump["depth_lowres"][0, 0]   # [H/4, W/4]
-            d_high = vis_dump["depth_highres"][0, 0] # [H, W]
-            
-            # Normalize for visualization [min, max] -> [0, 1]
-            d_min, d_max = d_high.min(), d_high.max()
-            if d_max > d_min:
-                d_low_norm = (d_low - d_min) / (d_max - d_min)
-                d_high_norm = (d_high - d_min) / (d_max - d_min)
-            else:
-                d_low_norm, d_high_norm = d_low * 0, d_high * 0
-                
-            # Upscale low-res for concatenation
-            d_low_up = F.interpolate(d_low_norm.unsqueeze(0).unsqueeze(0), size=(h, w), mode='nearest').squeeze()
-            depth_cat = torch.cat([d_low_up, d_high_norm], dim=-1) # [H, 2W]
-            torchvision.utils.save_image(depth_cat, vis_depth_dir / f"step_{self.global_step:0>6}.png")
-            
-            # 3.5 Save CNN Features (first 3 channels as RGB)
-            if "cnn_features" in vis_dump:
-                feat = vis_dump["cnn_features"][0, 0, :3].detach().cpu()
-                # Normalize feature for vis
-                f_min, f_max = feat.min(), feat.max()
-                feat = (feat - f_min) / (f_max - f_min + 1e-8)
-                torchvision.utils.save_image(feat, vis_feat_dir / f"step_{self.global_step:0>6}.png")
 
 
         # Compute metrics.
         # Compute and log loss.
         total_loss = 0
+        loss_components = {}
         for loss_fn in self.losses:
             loss = loss_fn.forward(output, batch, gaussians, self.global_step)
             self.log(f"loss/{loss_fn.name}", loss)
+            loss_components[loss_fn.name] = loss.item()
             total_loss = total_loss + loss
-        
+
         # Opacity regularization: 防止所有 Gaussian 變透明（opacity → 0）
         opacity_mean = gaussians.opacities.mean()
         opacity_reg_weight = 0.1
         opacity_target = 0.3
         opacity_reg = opacity_reg_weight * torch.relu(opacity_target - opacity_mean)
-        total_loss = total_loss + opacity_reg
+        self.log("loss/opacity_reg", opacity_reg)
+        loss_components["opacity_reg"] = opacity_reg.item()
+        total_loss = total_loss #+ opacity_reg
 
         # ---------- DAMV2 Pearson Loss ----------
+        damv2_raw = None
+        damv2_weighted = None
         if (
             self.damv2 is not None
             and self.train_cfg.damv2_loss_weight > 0
@@ -610,14 +498,33 @@ class ModelWrapper(LightningModule):
                 batch["context"]["image"],
                 cv_depth_map,
             )
+            damv2_weighted_tensor = self.train_cfg.damv2_loss_weight * damv2_loss
             self.log("loss/damv2_pearson", damv2_loss)
-            try:
-                wandb.log({"loss/damv2_pearson": damv2_loss.item()}, step=self.global_step)
-            except Exception:
-                pass
-            total_loss = total_loss + self.train_cfg.damv2_loss_weight * damv2_loss
+            self.log("loss/damv2_pearson_weighted", damv2_weighted_tensor)
+            damv2_raw = damv2_loss.item()
+            damv2_weighted = damv2_weighted_tensor.item()
+            total_loss = total_loss + damv2_weighted_tensor
 
         self.log("loss/total", total_loss)
+
+        if self.global_rank == 0:
+            mse_w = next((lf.cfg.weight for lf in self.losses if lf.name == "mse"), None)
+            lpips_w = next((lf.cfg.weight for lf in self.losses if lf.name == "lpips"), None)
+            damv2_w = self.train_cfg.damv2_loss_weight
+            mse_str = f"mse(w={mse_w})={loss_components.get('mse', 0.0):.4f}"
+            lpips_str = f"lpips(w={lpips_w})={loss_components.get('lpips', 0.0):.4f}"
+            opa_str = f"opacity_reg(w={opacity_reg_weight})={loss_components.get('opacity_reg', 0.0):.4f}"
+            if damv2_raw is not None:
+                damv2_str = (
+                    f"damv2_raw={damv2_raw:.4f} "
+                    f"damv2_weighted(w={damv2_w})={damv2_weighted:.4f}"
+                )
+            else:
+                damv2_str = f"damv2=off(w={damv2_w}, warmup={self.train_cfg.damv2_loss_warmup_steps})"
+            print(
+                f"[LOSS-DBG step {self.global_step}] {mse_str} {lpips_str} {opa_str} "
+                f"{damv2_str} total={total_loss.item():.4f}"
+            )
 
         # ---------- DAMV2 Pearson Observation (visualisation + per-view correlation log) ----------
         if (
@@ -660,7 +567,7 @@ class ModelWrapper(LightningModule):
                 sh = gaussians.harmonics[b_idx]        # Should be (N, 3, D_SH)
                 
                 export_ply(
-                    batch["target"]["extrinsics"][b_idx, 0], # Reference camera
+                    batch["context"]["extrinsics"][b_idx, 0], # Reference camera (context view 0)
                     means,
                     scales,
                     rotations,
@@ -682,7 +589,6 @@ class ModelWrapper(LightningModule):
                     # 額外資訊
                     "step": self.global_step,
                     "scene": batch["scene"][b_idx] if "scene" in batch else "unknown",
-                    "target_extrinsics": batch["target"]["extrinsics"][b_idx].detach().cpu(),
                     "context_extrinsics": batch["context"]["extrinsics"][b_idx].detach().cpu(),
                 }
                 torch.save(gaussians_data, pt_path)
@@ -961,13 +867,10 @@ class ModelWrapper(LightningModule):
         self.log("val/ssim_val", ssim, sync_dist=True)
         self.log("val/mse_val", mse, sync_dist=True)
 
-        # Validation losses (same loss functions as training, for direct comparison).
-        val_total = 0
-        for loss_fn in self.losses:
-            val_loss = loss_fn.forward(output_softmax, batch, gaussians_softmax, self.global_step)
-            self.log(f"val/{loss_fn.name}", val_loss, sync_dist=True)
-            val_total = val_total + val_loss
-        self.log("val/total", val_total, sync_dist=True)
+        # NOTE: self.losses now read batch["context"]["image"] (training is context-only),
+        # while output_softmax is rendered at target cameras. They would compare apples to
+        # oranges, so the val/{loss_name} logs are skipped. val/lpips_val, val/ssim_val,
+        # and val/mse_val above already capture novel-view quality on the held-out target.
 
         # Save rendered vs GT images and log to WandB (rank 0 only).
         if self.global_rank == 0:

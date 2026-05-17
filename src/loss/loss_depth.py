@@ -32,8 +32,8 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
         global_step: int,
     ) -> Float[Tensor, ""]:
         # Scale the depth between the near and far planes.
-        near = batch["target"]["near"][..., None, None].log()
-        far = batch["target"]["far"][..., None, None].log()
+        near = batch["context"]["near"][..., None, None].log()
+        far = batch["context"]["far"][..., None, None].log()
         depth = prediction.depth.minimum(far).maximum(near)
         depth = (depth - near) / (far - near)
 
@@ -48,7 +48,7 @@ class LossDepth(Loss[LossDepthCfg, LossDepthCfgWrapper]):
 
         # If desired, add bilateral filtering.
         if self.cfg.sigma_image is not None:
-            color_gt = batch["target"]["image"]
+            color_gt = batch["context"]["image"]
             color_dx = reduce(color_gt.diff(dim=-1), "b v c h w -> b v h w", "max")
             color_dy = reduce(color_gt.diff(dim=-2), "b v c h w -> b v h w", "max")
             if self.cfg.use_second_derivative:

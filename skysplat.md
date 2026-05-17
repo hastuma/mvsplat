@@ -24,7 +24,7 @@
 
 ### 1. Input & Preprocessing
 
-- **Input**: $N$ satellite image patches (e.g., 3 context views + 1 target view), each cropped to a fixed resolution (e.g., 256×256).
+- **Input**: $N$ satellite image patches, each cropped to a fixed resolution (e.g., 256×256). Training uses **3 context views only** (no target); validation/test additionally hold out 1 target view for novel-view metrics.
 - **Metadata**: Each patch is accompanied by its **RPC file** — 80 coefficients encoding the non-linear mapping from (lon, lat, height) → (col, row) in the original full-resolution image.
 - **Patch Offset**: The pixel offset of the patch within the original full image is recorded to enable principal-point correction.
 - **ENU Origin**: A shared geographic reference point (lat₀, lon₀, h₀) is assigned per scene, used as the origin of the local ENU coordinate system.
@@ -83,9 +83,9 @@ The target camera parameters (extrinsics) are computed in the same ENU frame, en
 
 ### 7. Differentiable Rendering & Optimization
 
-- **3DGS Rasterizer**: The geo-aligned Gaussians are rendered using the standard differentiable 3DGS rasterizer with the ENU-frame camera parameters.
+- **3DGS Rasterizer**: The geo-aligned Gaussians are rendered using the standard differentiable 3DGS rasterizer with the ENU-frame camera parameters. During training, Gaussians are rendered back at the **context** cameras (V=3) — there is no held-out target view at train time. Near/far for this render uses a wide **`dist ± 50000m`** sweep so all Gaussians stay inside the rasterizer frustum given satellite-scale camera distances.
 - **Loss Functions**:
-  - **$L_\text{RGB}$**: Photometric reconstruction loss (MSE + LPIPS) between rendered and target images.
+  - **$L_\text{RGB}$**: Photometric reconstruction loss (MSE + LPIPS) between rendered and **context** images, averaged over V=3 context views (self-supervised reconstruction of the input views). Validation/test still measure novel-view quality on a held-out target view via `val/lpips_val`, `val/ssim_val`, `val/mse_val`.
   - **$L_\text{Smooth}$**: Regularization on $\Delta \text{Pos}$ to prevent geometry collapse.
   - **$L_\text{Opacity}$**: Penalty when mean opacity falls below 0.3, preventing Gaussians from collapsing to transparent.
   - **$L_\text{DAMV2}$**: Pearson correlation loss between cost-volume depth and frozen Depth Anything V2 (DAMv2) relative depth. DAMv2 acts as a monocular depth teacher (weights frozen); only the encoder depth receives gradients. Controlled by `damv2_loss_weight` (default 0.1) and `damv2_loss_warmup_steps` (default 500) in the experiment config.

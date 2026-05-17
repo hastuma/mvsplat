@@ -40,7 +40,7 @@ class LossLpips(Loss[LossLpipsCfg, LossLpipsCfgWrapper]):
         gaussians: Gaussians,
         global_step: int,
     ) -> Float[Tensor, ""]:
-        image = batch["target"]["image"]
+        image = batch["context"]["image"]
 
         # Before the specified step, don't apply the loss.
         if global_step < self.cfg.apply_after_step:

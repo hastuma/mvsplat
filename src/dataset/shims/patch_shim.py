@@ -31,8 +31,10 @@ def apply_patch_shim(batch: BatchedExample, patch_size: int) -> BatchedExample:
     """Crop images in the batch so that their dimensions are cleanly divisible by the
     specified patch size.
     """
-    return {
+    out = {
         **batch,
         "context": apply_patch_shim_to_views(batch["context"], patch_size),
-        "target": apply_patch_shim_to_views(batch["target"], patch_size),
     }
+    if "target" in batch:
+        out["target"] = apply_patch_shim_to_views(batch["target"], patch_size)
+    return out
